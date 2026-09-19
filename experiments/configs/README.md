@@ -23,9 +23,8 @@ O `run_id` fixo define `outputs/checkpoints/<run_id>/` e
 ele, o trainer gera `protonet_<mod>_<k>s_<timestamp>` e cada invocação cria um
 diretório novo, onde o `last.pt` nunca é encontrado. Como contrapartida,
 **re-rodar o mesmo config sobrescreve a run anterior** — para variar
-hiperparâmetros, copie o arquivo com outro nome (e outro `run_id`). Os notebooks
-de Colab/Kaggle sobrescrevem `cfg["run_id"]` depois de carregar, então não são
-afetados.
+hiperparâmetros, copie o arquivo com outro nome (e outro `run_id`). O notebook
+do Kaggle sobrescreve `cfg["run_id"]` depois de carregar, então não é afetado.
 
 ## Configs disponíveis
 
@@ -37,8 +36,8 @@ afetados.
 | `skeleton_2d` | `protonet_skeleton2d_5w1s.yaml` | `protonet_skeleton2d_5w5s.yaml` |
 | `skeleton_3d` | `protonet_skeleton3d_5w1s.yaml` | `protonet_skeleton3d_5w5s.yaml` |
 
-Arquivos com prefixo `_` (`_colab_active.yaml`, `_kaggle_active.yaml`) são
-derivados gerados pelos notebooks — não edite à mão.
+Arquivos com prefixo `_` (`_kaggle_active.yaml`) são derivados gerados pelo
+notebook — não edite à mão.
 
 ## Cobertura de dados por modalidade
 
@@ -241,8 +240,8 @@ usados na avaliação. Medido com o mesmo lote e a mesma seed:
 | `eval()` | 0.000 |
 
 Ou seja: **duas runs com `batch_size` diferente não são comparáveis**, mesmo com
-tudo o mais idêntico. Por isso os configs fixam `16` explicitamente e **os
-notebooks de Colab/Kaggle não sobrescrevem mais esse valor** — ele faz parte do
+tudo o mais idêntico. Por isso os configs fixam `16` explicitamente e **o
+notebook do Kaggle não sobrescreve mais esse valor** — ele faz parte do
 protocolo experimental, não da configuração da máquina.
 
 `16` foi escolhido por ser o valor que roda em T4/P100/L4 (as GPUs de fato
@@ -271,7 +270,7 @@ diferentes e **não são comparáveis entre si** nem com as novas:
 | Run | `batch_size` | Observação |
 | --- | --- | --- |
 | `protonet_rgb_5w5s_colab` | 32 | 100 épocas, best_val=0.916. Refazer para entrar na comparação. |
-| `protonet_rgb_5w1s_kaggle` | 16 | 23/40 épocas, best_val=0.796. Compatível com o protocolo atual. |
+| `protonet_rgb_5w1s_kaggle` | 16 | 23/50 épocas, best_val=0.796. Compatível com o protocolo atual. |
 
 ### `episode`
 
@@ -293,7 +292,7 @@ com partição 6/3/3 — ver a seção "Splits" do README raiz.
 
 | Chave | Default | Efeito |
 | --- | --- | --- |
-| `epochs` | `100` | Alvo de épocas. `--resume` continua até esse número, então dá para treinar em blocos aumentando o valor entre sessões. |
+| `epochs` | `50` | Alvo de épocas. `--resume` continua até esse número, então dá para treinar em blocos aumentando o valor entre sessões. |
 | `learning_rate` | `1e-4` | LR do Adam. |
 | `weight_decay` | `0.0` | Weight decay do Adam. |
 | `eval_every` | `5` | Intervalo (em épocas) da validação episódica. |

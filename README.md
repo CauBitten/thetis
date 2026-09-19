@@ -102,8 +102,7 @@ Thetis/
 │   ├── 01_eda.ipynb            # Análise exploratória do THETIS
 │   ├── 02_episode_design.ipynb # Construção dos splits episódicos
 │   ├── 03_results.ipynb        # Análise comparativa entre métodos
-│   ├── colab_train_protonet.ipynb   # Meta-treino no Google Colab (RGB 5w5s)
-│   └── kaggle_train_protonet.ipynb  # Meta-treino no Kaggle (RGB 5w1s, com --resume)
+│   └── kaggle_train_protonet.ipynb  # Meta-treino no Kaggle (5 modalidades × 1/5-shot, com --resume)
 │
 ├── experiments/
 │   ├── configs/                # Um .yaml por experimento (método × modalidade × N × K)
@@ -270,7 +269,7 @@ Cada run grava, **a cada época**:
 ### Retomar um treino interrompido
 
 `--resume` continua da época seguinte à do `last.pt` — o alvo é `optim.epochs`
-da config, então dá para treinar em blocos (40 → 80 → 100 épocas) aumentando
+da config, então dá para treinar em blocos (20 → 40 → 50 épocas) aumentando
 esse número entre as sessões:
 
 ```bash
@@ -288,15 +287,16 @@ Os episódios são endereçados por índice e o sampler é determinístico por �
 então a run retomada vê a mesma sequência de episódios de uma run contínua (só o
 RNG de augmentation reinicia).
 
-### Treinar no Colab ou no Kaggle
+### Treinar no Kaggle
 
-Quem não tem GPU local roda pelos notebooks em `notebooks/`, que clonam este
-repositório, montam a config derivada e treinam:
+Quem não tem GPU local roda por `notebooks/kaggle_train_protonet.ipynb`, que
+clona este repositório, monta a config derivada e treina. Ele serve as cinco
+modalidades × {1-shot, 5-shot}: escolha `MODALITY` e `K_SHOT` na seção 1 e o
+resto do notebook se ajusta.
 
-- `colab_train_protonet.ipynb` — Colab, dados vindos do Google Drive.
-- `kaggle_train_protonet.ipynb` — Kaggle, dados como *Dataset* anexado. O
-  manifesto é regenerado a partir da árvore `VIDEO_RGB` e o treino usa
-  `--resume`, porque uma sessão do Kaggle (~12 h) não cobre as 100 épocas.
+Os dados entram como *Dataset* anexado, o manifesto é regenerado a partir da
+árvore da modalidade, e o treino usa `--resume`, porque uma sessão do Kaggle
+(~12 h) não cobre as 50 épocas.
 
 ### Avaliação episódica
 
@@ -388,7 +388,7 @@ episode:
   episodes_meta_test: 1000
 
 optim:
-  epochs: 100
+  epochs: 50
   learning_rate: 0.0001
   weight_decay: 0.0
   eval_every: 5
