@@ -1,0 +1,54 @@
+# TRX · skeleton3d · 5-way 1-shot (meta_val/meta_test rodam 3-way; split 6/3/3).
+# Vídeo de VISUALIZAÇÃO do esqueleto 3D, não coordenadas de junta (cobertura ~61%: 93-110 clipes/classe).
+# Documentação de todas as chaves: experiments/configs/README.md
+method: trx
+run_id: trx_skeleton3d_5w1s
+
+modalities:
+  - skeleton_3d
+
+encoder:
+  name: resnet50               # por frame, ImageNet (backbone do artigo)
+  pretrained: true
+  batch_size: 16
+  gradient_checkpointing: true
+
+model:                         # hiperparâmetros do artigo (Perrett et al. 2021)
+  temporal_set_sizes: [2, 3]   # Ω: pares e trios de frames
+  d_model: 1152
+  dropout: 0.1
+  pe_scale: 0.1
+
+episode:
+  n_way: 5
+  n_way_val: 3
+  n_way_test: 3
+  k_shot: 1
+  q_query: 15
+  episodes_per_epoch: 200
+  episodes_meta_val: 100
+  episodes_meta_test: 1000
+
+optim:
+  epochs: 50
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  eval_every: 5
+  fp16: true
+  stream_query: true
+
+data:
+  manifest_path: data/processed/manifest.csv
+  dataset_root: dataset
+  train_classes: 6
+  val_classes: 3
+  test_classes: 3
+  frame_count: 8               # como no artigo; C(8,2)+C(8,3) = 84 tuplas
+  resize_size: 128
+  spatial_size: 112            # o artigo usa 224; 112 mantém a entrada do ProtoNet
+  temporal_sampling: segment   # um frame por segmento, como no artigo
+  temporal_oversample: 4       # 32 frames decodificados por clipe
+  cache_decoded: true
+  exclude_defective: true      # pula clipes em branco e duplicatas byte a byte do THETIS
+
+seed: 42

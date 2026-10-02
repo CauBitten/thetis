@@ -1,4 +1,4 @@
-'''Episodic evaluation of a trained ProtoNet checkpoint on meta_test.
+'''Episodic evaluation of a trained FSAR checkpoint on meta_test.
 
 Loads ``best.pt`` (or any checkpoint produced by :mod:`meta_trainer`), reads
 either pre-serialised episodes from ``data/episodes/meta_test/episodes.jsonl``
@@ -36,8 +36,7 @@ from src.data.loader import (  # noqa: E402
     ThetisDataset,
     load_exclusions,
 )
-from src.models.encoders import VideoEncoder  # noqa: E402
-from src.models.protonet import ProtoNet  # noqa: E402
+from src.models.factory import build_encoder, build_model  # noqa: E402
 from src.training.meta_trainer import (  # noqa: E402
     EpisodeLoader,
     assemble_episode_tensors,
@@ -127,8 +126,10 @@ def run_eval(
     device = select_device(device_arg)
 
     encoder_cfg = cfg.get('encoder', {})
-    encoder = VideoEncoder(name=encoder_cfg.get('name', 'r2plus1d_18'), pretrained=False)
-    model = ProtoNet(encoder).to(device)
+    encoder = build_encoder(encoder_cfg, pretrained=False)
+    # Chunked encoding only bounds memory here: in eval() BatchNorm uses running
+    # stats, so the chunk size does not change the embeddings.
+    model = build_model(cfg, encoder, encoder_batch_size=encoder_cfg.get('batch_size')).to(device)
     model.load_state_dict(blob['model_state'])
     model.eval()
 
@@ -230,7 +231,7 @@ def run_eval(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='Evaluate a trained ProtoNet checkpoint on meta_test.')
+    parser = argparse.ArgumentParser(description='Evaluate a trained FSAR checkpoint on meta_test.')
     parser.add_argument('--checkpoint', type=Path, required=True)
     parser.add_argument(
         '--episodes',

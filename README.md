@@ -86,8 +86,11 @@ Thetis/
 │   │   ├── optical_flow.py     # Cálculo de fluxo óptico
 │   │   └── text.py             # Embeddings de descrições textuais dos golpes
 │   ├── models/
+│   │   ├── base.py             # Interface episódica comum (support_state / query_logits)
+│   │   ├── encoders.py         # Encoders de vídeo (R(2+1)D) e por frame (ResNet 2D)
+│   │   ├── factory.py          # config → encoder + cabeça (registro METHODS)
 │   │   ├── protonet.py         # Baseline: Prototypical Networks
-│   │   ├── trx.py              # TRX (cross-attention temporal)
+│   │   ├── trx.py              # TRX (cross-attention temporal) — implementado
 │   │   ├── mvp_shot.py         # MVP-Shot (alinhamento multi-velocidade)
 │   │   ├── safsar.py           # SAFSAR (vídeo + texto)
 │   │   └── vpd.py              # Video Pose Distillation
@@ -102,7 +105,8 @@ Thetis/
 │   ├── 01_eda.ipynb            # Análise exploratória do THETIS
 │   ├── 02_episode_design.ipynb # Construção dos splits episódicos
 │   ├── 03_results.ipynb        # Análise comparativa entre métodos
-│   └── kaggle_train_protonet.ipynb  # Meta-treino no Kaggle (5 modalidades × 1/5-shot, com --resume)
+│   ├── kaggle_train_protonet.ipynb  # Meta-treino no Kaggle (5 modalidades × 1/5-shot, com --resume)
+│   └── kaggle_train_trx.ipynb       # Idem para o TRX (ResNet-50 por frame)
 │
 ├── experiments/
 │   ├── configs/                # Um .yaml por experimento (método × modalidade × N × K)
@@ -261,6 +265,18 @@ uv run python src/training/meta_trainer.py \
     --smoke
 ```
 
+### Meta-treinar o TRX
+
+```bash
+uv run python src/training/meta_trainer.py \
+    --config experiments/configs/trx_rgb_5w5s.yaml
+```
+
+Mesmos splits, episódios e avaliação do ProtoNet; muda o encoder (ResNet-50
+ImageNet, por frame), `frame_count: 8` e a amostragem temporal do treino
+(`segment`). Os detalhes e o que difere do artigo estão na seção "TRX" de
+[`experiments/configs/README.md`](experiments/configs/README.md).
+
 Cada run grava, **a cada época**:
 
 - `outputs/checkpoints/<run_id>/last.pt` (modelo + optimizer + histórico) e `best.pt` (melhor val_acc)
@@ -289,8 +305,9 @@ RNG de augmentation reinicia).
 
 ### Treinar no Kaggle
 
-Quem não tem GPU local roda por `notebooks/kaggle_train_protonet.ipynb`, que
-clona este repositório, monta a config derivada e treina. Ele serve as cinco
+Quem não tem GPU local roda por `notebooks/kaggle_train_protonet.ipynb` (ou
+`notebooks/kaggle_train_trx.ipynb`, para o TRX), que clona este repositório,
+monta a config derivada e treina. Ele serve as cinco
 modalidades × {1-shot, 5-shot}: escolha `MODALITY` e `K_SHOT` na seção 1 e o
 resto do notebook se ajusta.
 
@@ -358,8 +375,8 @@ Cada arquivo de vídeo segue o padrão `{actor}_{action}_{sequence}.avi`.
 
 Cada experimento é definido por um arquivo `.yaml` em `experiments/configs/`.
 Todos seguem o **mesmo schema**, com todas as chaves lidas pelo código escritas
-explicitamente — entre dois configs quaisquer só mudam `run_id`, `modalities` e
-`episode.k_shot`. A referência completa de cada chave (defaults, efeito em
+explicitamente — entre dois configs do mesmo método só mudam `run_id`,
+`modalities` e `episode.k_shot`. A referência completa de cada chave (defaults, efeito em
 VRAM/velocidade, limitações conhecidas) está em
 [`experiments/configs/README.md`](experiments/configs/README.md).
 
@@ -374,8 +391,8 @@ modalities:                   # a Fase 2 aceita uma modalidade por config
 encoder:
   name: r2plus1d_18
   pretrained: true
-  batch_size: 8               # vídeos por forward; principal knob de OOM
-  gradient_checkpointing: true
+  batch_size: 16              # vídeos por chunk do encoder; hiperparâmetro (BatchNorm), não knob de OOM
+  gradient_checkpointing: true  # parte do protocolo: altera as estatísticas do BatchNorm
 
 episode:
   n_way: 5
@@ -393,7 +410,7 @@ optim:
   weight_decay: 0.0
   eval_every: 5
   fp16: true                  # autocast AMP (CUDA)
-  stream_query: true          # query em micro-batches + acumulação de gradiente
+  stream_query: true          # query em micro-batches; parte do protocolo (lotes do BatchNorm)
 
 data:
   manifest_path: data/processed/manifest.csv
@@ -419,6 +436,9 @@ por combinação:
 | `mask` | `protonet_mask_5w1s.yaml` | `protonet_mask_5w5s.yaml` |
 | `skeleton_2d` | `protonet_skeleton2d_5w1s.yaml` | `protonet_skeleton2d_5w5s.yaml` |
 | `skeleton_3d` | `protonet_skeleton3d_5w1s.yaml` | `protonet_skeleton3d_5w5s.yaml` |
+
+O TRX tem os mesmos 10, com prefixo `trx_` (`trx_rgb_5w1s.yaml`, …,
+`trx_skeleton3d_5w5s.yaml`).
 
 Cenários previstos:
 

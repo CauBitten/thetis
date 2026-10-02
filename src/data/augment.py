@@ -130,6 +130,46 @@ class RandomTemporalCrop:
         return sample
 
 
+class RandomSegmentSample:
+    '''TSN-style sampling: one random frame from each of ``num_frames`` equal segments.
+
+    Unlike :class:`RandomTemporalCrop`, the output always spans the whole clip,
+    so training sees the full stroke at the same temporal extent as evaluation
+    (which samples ``num_frames`` uniformly over the clip). The randomness is
+    only the jitter inside each segment. Indices are drawn once per sample and
+    shared across modalities.
+
+    If a video has fewer than ``num_frames`` frames, frames are repeated on a
+    uniform grid (same as the loader's ``linspace`` resampling) instead of
+    padding the tail, so temporal coverage is preserved.
+    '''
+
+    def __init__(self, num_frames: int, seed: int | None = None) -> None:
+        if num_frames <= 0:
+            raise ValueError('num_frames must be positive')
+        self.num_frames = int(num_frames)
+        self._rng = np.random.default_rng(seed)
+
+    def _indices(self, t: int) -> np.ndarray:
+        if t < self.num_frames:
+            return np.linspace(0, t - 1, num=self.num_frames).round().astype(int)
+        # Integer segment edges; each segment has >= 1 frame because t >= num_frames.
+        edges = (np.arange(self.num_frames + 1) * t) // self.num_frames
+        return self._rng.integers(edges[:-1], edges[1:])
+
+    def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
+        keys = _video_keys_present(sample)
+        if not keys:
+            return sample
+        indices = self._indices(int(_video_shape(sample[keys[0]])[0]))
+        for key in keys:
+            video = sample[key]
+            arr = _to_numpy(video)
+            sampled = arr[np.minimum(indices, arr.shape[0] - 1)]
+            sample[key] = _from_numpy_like(sampled, video)
+        return sample
+
+
 class RandomSpatialCrop:
     '''Pick a random ``(h,w)`` crop region, identical across modalities.'''
 
@@ -462,6 +502,7 @@ __all__ = [
     'COORD_KEYS_3D',
     'Compose',
     'RandomTemporalCrop',
+    'RandomSegmentSample',
     'RandomSpatialCrop',
     'CenterSpatialCrop',
     'ResizeVideo',

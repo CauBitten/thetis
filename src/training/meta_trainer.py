@@ -3,8 +3,9 @@
 Single entry point ``main(argv)``. Reads a YAML config (see
 ``experiments/configs/protonet_rgb_5w5s.yaml`` for the schema), assembles a
 :class:`src.data.loader.ThetisDataset`, samples N-way K-shot episodes via
-:class:`src.data.episode_sampler.EpisodeSampler`, and runs a ProtoNet meta
-loop with periodic eval on ``meta_val``. Checkpoints land in
+:class:`src.data.episode_sampler.EpisodeSampler`, and meta-trains the head
+named by ``method`` (see :data:`src.models.factory.METHODS`) with periodic
+eval on ``meta_val``. Checkpoints land in
 ``outputs/checkpoints/<run_id>/`` and a JSON training log in
 ``experiments/logs/<run_id>/training.json``.
 
@@ -43,6 +44,7 @@ from src.data.augment import (  # noqa: E402
     ColorJitter,
     Compose,
     HorizontalFlip,
+    RandomSegmentSample,
     RandomSpatialCrop,
     RandomTemporalCrop,
     ResizeVideo,
@@ -55,8 +57,8 @@ from src.data.loader import (  # noqa: E402
     ThetisDataset,
 )
 from src.data.loader import load_exclusions  # noqa: E402
-from src.models.encoders import VideoEncoder  # noqa: E402
-from src.models.protonet import ProtoNet  # noqa: E402
+from src.models.base import EpisodicModel  # noqa: E402
+from src.models.factory import METHODS, build_encoder, build_model  # noqa: E402
 from src.utils.metrics import accuracy_with_ci  # noqa: E402
 
 
@@ -73,9 +75,8 @@ def load_config(path: str | Path) -> dict[str, Any]:
     for required in ('method', 'modalities', 'episode', 'optim', 'data', 'seed'):
         if required not in cfg:
             raise KeyError(f'missing required config key: {required!r}')
-    if cfg['method'] != 'protonet':
-        # Phase 2 only ships ProtoNet; other methods come in later phases.
-        raise NotImplementedError(f'method {cfg["method"]!r} not implemented yet')
+    if cfg['method'] not in METHODS:
+        raise NotImplementedError(f'method {cfg["method"]!r} not implemented; available: {list(METHODS)}')
     modalities = cfg['modalities']
     if not modalities or not isinstance(modalities, list):
         raise ValueError('config.modalities must be a non-empty list')
@@ -213,12 +214,35 @@ def assemble_episode_tensors(
 # ---------------------------------------------------------------------------
 
 
+TEMPORAL_SAMPLERS = {'crop': RandomTemporalCrop, 'segment': RandomSegmentSample}
+
+
+def temporal_oversample(cfg_data: dict[str, Any]) -> int:
+    '''Factor by which the train dataset over-decodes ``frame_count`` before the temporal step.'''
+    factor = int(cfg_data.get('temporal_oversample', 2))
+    if factor < 1:
+        raise ValueError(f'data.temporal_oversample must be >= 1, got {factor}')
+    return factor
+
+
 def build_train_transform(cfg_data: dict[str, Any], seed: int) -> Compose:
+    '''Train-time augmentation. ``data.temporal_sampling`` picks the temporal step:
+
+    - ``crop`` (default): contiguous window of ``frame_count`` out of the
+      over-decoded clip — covers ``1/temporal_oversample`` of the stroke.
+    - ``segment``: one random frame per segment — always spans the whole clip.
+
+    Evaluation is unaffected either way (``build_eval_transform`` has no
+    temporal step; the eval dataset decodes ``frame_count`` uniformly).
+    '''
     frames = int(cfg_data.get('frame_count', 16))
     resize = int(cfg_data.get('resize_size', 128))
     crop = int(cfg_data.get('spatial_size', 112))
+    sampling = cfg_data.get('temporal_sampling', 'crop')
+    if sampling not in TEMPORAL_SAMPLERS:
+        raise ValueError(f'unknown data.temporal_sampling {sampling!r}; valid: {list(TEMPORAL_SAMPLERS)}')
     return Compose([
-        RandomTemporalCrop(num_frames=frames, seed=seed),
+        TEMPORAL_SAMPLERS[sampling](num_frames=frames, seed=seed),
         ResizeVideo(size=resize),
         RandomSpatialCrop(size=crop, seed=seed + 1),
         HorizontalFlip(p=0.5, seed=seed + 2),
@@ -265,7 +289,7 @@ def _make_sampler(
 
 
 def _run_eval(
-    model: ProtoNet,
+    model: EpisodicModel,
     sampler: EpisodeSampler,
     loader: EpisodeLoader,
     split: str,
@@ -276,7 +300,7 @@ def _run_eval(
 ) -> tuple[float, float, float]:
     '''Run ``n_episodes`` from ``split``; return ``(mean_acc, ci_half_width, mean_loss)``.
 
-    The ProtoNet forward already computes the query cross-entropy, so ``mean_loss``
+    The model forward already computes the query cross-entropy, so ``mean_loss``
     is essentially free here — it just averages ``out['loss']`` across episodes.
     Useful to catch overfitting when val_acc plateaus but val_loss creeps back up.
     '''
@@ -325,7 +349,7 @@ def _log_cuda_mem(tag: str, device: torch.device) -> None:
 
 
 def _train_step_streaming(
-    model: ProtoNet,
+    model: EpisodicModel,
     tensors: dict[str, torch.Tensor],
     n_way: int,
     optimizer: optim.Optimizer,
@@ -336,14 +360,20 @@ def _train_step_streaming(
 ) -> tuple[float, float]:
     '''One training step with the query set streamed in micro-batches.
 
-    Encodes the (small) support set once to build prototypes, then walks the query
-    set ``encoder_batch_size`` clips at a time, calling ``backward`` per micro-batch
-    with ``retain_graph`` so the shared support graph survives until the last one.
-    Peak activation memory is ~``support + one micro-batch`` instead of the whole
-    episode, yet the accumulated gradient is mathematically identical to a single
+    Encodes the (small) support set once to build the head's support state
+    (ProtoNet: prototypes), then walks the query set ``encoder_batch_size`` clips
+    at a time, calling ``backward`` per micro-batch with ``retain_graph`` so the
+    shared support graph survives until the last one. Peak activation memory is
+    ~``support + one micro-batch`` instead of the whole episode. For a BatchNorm-free
+    encoder the accumulated gradient is mathematically identical to a single
     full-batch ``backward`` (each micro-batch contributes ``sum(ce) / n_query``, so
-    the accumulated ``.grad`` equals the mean-CE gradient). Returns
-    ``(episode_loss, episode_accuracy)`` matching ``ProtoNet.forward`` semantics.
+    the accumulated ``.grad`` equals the mean-CE gradient), given a head whose
+    ``query_logits`` scores each query independently (the EpisodicModel contract).
+    With BatchNorm in ``train()`` mode it is *not* identical: the support set and
+    each query micro-batch are normalised as separate batches, whereas the classic
+    path normalises mixed support+query chunks — hence ``stream_query`` is part of
+    the experimental protocol. Returns
+    ``(episode_loss, episode_accuracy)`` matching ``EpisodicModel.forward`` semantics.
     '''
     optimizer.zero_grad(set_to_none=True)
     support = tensors['support']
@@ -358,7 +388,7 @@ def _train_step_streaming(
 
     with amp_ctx:
         support_emb = model.encoder(support)
-        prototypes = model._prototypes(support_emb, support_labels, n_way)
+        state = model.support_state(support_emb, support_labels, n_way)
     if profile:
         _log_cuda_mem('after-support', device)
 
@@ -372,7 +402,7 @@ def _train_step_streaming(
         labels_mb = query_labels[start:end]
         with amp_ctx:
             query_emb = model.encoder(query[start:end])
-            logits = model._logits(query_emb, prototypes)
+            logits = model.query_logits(query_emb, state)
             # reduction='sum' / n_query reproduces the full-episode mean CE exactly.
             loss_mb = F.cross_entropy(logits, labels_mb, reduction='sum') / n_query
         if scaler is not None:
@@ -504,7 +534,8 @@ def run_training(
         modalities=[modality],
         dataset_root=dataset_root,
         transform=None,  # transform applied inside EpisodeLoader to keep eval-vs-train clean
-        frame_count=frame_count * 2 if not smoke else frame_count,  # over-sample then temporal-crop
+        # over-sample, then the temporal step (crop or segment) brings it back to frame_count
+        frame_count=frame_count * temporal_oversample(data_cfg) if not smoke else frame_count,
         return_tensors=True,
         cache=cache_decoded,
         cache_resize=cache_resize,
@@ -535,17 +566,13 @@ def run_training(
         except Exception:  # noqa: BLE001
             pass
     use_checkpointing = bool(encoder_cfg.get('gradient_checkpointing', auto_checkpoint))
-    encoder = VideoEncoder(
-        name=encoder_cfg.get('name', 'r2plus1d_18'),
-        pretrained=pretrained,
-        use_checkpointing=use_checkpointing,
-    )
+    encoder = build_encoder(encoder_cfg, pretrained=pretrained, use_checkpointing=use_checkpointing)
     # Chunked encoding: cap activations memory by running the encoder on at most
     # this many videos per forward. Critical on CPU where R(2+1)D-18 with batch=100
     # silently kills the process and on small GPUs (≤6 GB) where batch=32 OOMs.
     encoder_batch_default = _default_encoder_batch_size(device, smoke=smoke)
     encoder_batch_size = int(encoder_cfg.get('batch_size', encoder_batch_default))
-    model = ProtoNet(encoder, encoder_batch_size=encoder_batch_size).to(device)
+    model = build_model(cfg, encoder, encoder_batch_size=encoder_batch_size).to(device)
 
     # Mixed precision: fp16 autocast on CUDA cuts activations roughly in half
     # and is the easiest knob to keep R(2+1)D-18 fitting in 4 GB GPUs.
@@ -553,7 +580,8 @@ def run_training(
     # Query streaming (grad accumulation) bounds training activation memory to
     # ~support + one micro-batch, the real fix for R(2+1)D-18 OOMs. Default on for
     # CUDA; classic full-batch backward otherwise (e.g. CPU smoke). Override via
-    # optim.stream_query.
+    # optim.stream_query — but it changes the BatchNorm batches, so keep it fixed
+    # across compared runs.
     stream_query = bool(cfg.get('optim', {}).get('stream_query', device.type == 'cuda'))
 
     optim_cfg = cfg['optim']
@@ -574,7 +602,7 @@ def run_training(
             pass
 
     print(
-        f'[setup] device={device}{vram_str} encoder={encoder_cfg.get("name", "r2plus1d_18")} '
+        f'[setup] device={device}{vram_str} method={cfg["method"]} encoder={encoder_cfg.get("name", "r2plus1d_18")} '
         f'pretrained={pretrained} encoder_batch_size={encoder_batch_size} fp16={use_amp} '
         f'grad_checkpoint={use_checkpointing} stream_query={stream_query} '
         f'n_way_train={n_way_train} n_way_val={n_way_val} k_shot={k_shot} q_query={q_query} '
@@ -588,7 +616,7 @@ def run_training(
     )
     print(f'[setup] splits = {splits}', flush=True)
 
-    run_id = cfg.get('run_id') or f'protonet_{modality}_{k_shot}s_{_timestamp()}'
+    run_id = cfg.get('run_id') or f'{cfg["method"]}_{modality}_{k_shot}s_{_timestamp()}'
     if smoke:
         run_id = f'smoke_{run_id}'
     out_root = Path(cfg.get('output_root', 'outputs')).resolve()
@@ -844,7 +872,7 @@ def _json_default(value: Any) -> Any:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='Meta-train an FSAR baseline (ProtoNet).')
+    parser = argparse.ArgumentParser(description='Meta-train an FSAR model (method set by the config).')
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--device', type=str, default=None, help='cuda | cpu | auto (default: auto)')
     parser.add_argument(

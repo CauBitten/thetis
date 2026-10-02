@@ -15,6 +15,7 @@ import pytest
 import torch
 from torch import nn
 
+from src.data.augment import RandomSegmentSample, RandomTemporalCrop
 from src.training.meta_trainer import (
     EpisodeLoader,
     assemble_episode_tensors,
@@ -22,6 +23,7 @@ from src.training.meta_trainer import (
     build_train_transform,
     load_config,
     run_training,
+    temporal_oversample,
 )
 from src.utils.metrics import accuracy_with_ci, per_class_confusion
 
@@ -85,7 +87,7 @@ def test_load_config_valid(tmp_path: Path) -> None:
 def test_load_config_rejects_unknown_method(tmp_path: Path) -> None:
     cfg_path = tmp_path / 'cfg.yaml'
     cfg_path.write_text(
-        'method: trx\n'
+        'method: not_a_method\n'
         'modalities: [rgb]\n'
         'episode: {n_way: 5, k_shot: 5, q_query: 15}\n'
         'optim: {epochs: 1}\n'
@@ -123,6 +125,48 @@ def test_build_train_transform_runs() -> None:
     rgb = out['rgb']
     arr = rgb.numpy() if isinstance(rgb, torch.Tensor) else rgb
     assert arr.shape == (8, 24, 24, 3)
+
+
+def _frame_indexed_video(t: int) -> np.ndarray:
+    '''``(t, 4, 4, 3)`` clip whose frame ``i`` is filled with ``i`` — output pixels reveal the indices.'''
+    return np.broadcast_to(np.arange(t, dtype=np.uint8)[:, None, None, None], (t, 4, 4, 3)).copy()
+
+
+def test_random_segment_sample_draws_one_frame_per_segment() -> None:
+    sampler = RandomSegmentSample(num_frames=8, seed=0)
+    for _ in range(20):
+        out = sampler({'rgb': _frame_indexed_video(32), 'depth': _frame_indexed_video(32)})
+        idx = out['rgb'][:, 0, 0, 0].astype(int)
+        assert idx.shape == (8,)
+        # 32 frames / 8 segments: segment i is [4i, 4i+4).
+        assert all(4 * i <= v < 4 * i + 4 for i, v in enumerate(idx))
+        np.testing.assert_array_equal(out['depth'], out['rgb'])
+
+
+def test_random_segment_sample_short_clip_repeats_on_uniform_grid() -> None:
+    out = RandomSegmentSample(num_frames=8, seed=0)({'rgb': _frame_indexed_video(4)})
+    idx = out['rgb'][:, 0, 0, 0].astype(int).tolist()
+    assert idx == [0, 0, 1, 1, 2, 2, 3, 3]
+
+
+def test_build_train_transform_temporal_sampling_option() -> None:
+    sizes = {'frame_count': 8, 'resize_size': 32, 'spatial_size': 24}
+    assert isinstance(build_train_transform(sizes, seed=0).transforms[0], RandomTemporalCrop)
+    segment = build_train_transform({**sizes, 'temporal_sampling': 'segment'}, seed=0)
+    assert isinstance(segment.transforms[0], RandomSegmentSample)
+    out = segment({'rgb': np.zeros((32, 64, 64, 3), dtype=np.uint8)})
+    rgb = out['rgb']
+    arr = rgb.numpy() if isinstance(rgb, torch.Tensor) else rgb
+    assert arr.shape == (8, 24, 24, 3)
+    with pytest.raises(ValueError, match='temporal_sampling'):
+        build_train_transform({**sizes, 'temporal_sampling': 'tsn'}, seed=0)
+
+
+def test_temporal_oversample_default_and_validation() -> None:
+    assert temporal_oversample({}) == 2
+    assert temporal_oversample({'temporal_oversample': 4}) == 4
+    with pytest.raises(ValueError, match='temporal_oversample'):
+        temporal_oversample({'temporal_oversample': 0})
 
 
 def test_build_eval_transform_is_deterministic() -> None:
@@ -268,7 +312,7 @@ def test_run_training_smoke_end_to_end(tmp_path: Path, monkeypatch: pytest.Monke
         return _SyntheticDataset(df_full, modality='rgb')
 
     monkeypatch.setattr('src.training.meta_trainer.ThetisDataset', _fake_dataset)
-    monkeypatch.setattr('src.training.meta_trainer.VideoEncoder', lambda **_kw: _ToyEncoder())
+    monkeypatch.setattr('src.models.factory.VideoEncoder', lambda **_kw: _ToyEncoder())
 
     log = run_training(cfg, smoke=True, device_arg='cpu')
 
@@ -352,7 +396,7 @@ def _mini_episode() -> dict[str, torch.Tensor]:
     }
 
 
-def _build_protonet() -> Any:
+def _build_protonet(per_frame: bool = False) -> Any:
     from src.models.protonet import ProtoNet  # noqa: PLC0415
 
     torch.manual_seed(7)
@@ -363,27 +407,31 @@ def _build_protonet() -> Any:
             self.lin = nn.Linear(3, 5)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return self.lin(x.to(torch.float32).mean(dim=(1, 2, 3)))
+            # per-frame: (B, T, 5), averaged over T by ProtoNet; else (B, 5)
+            pooled = x.to(torch.float32).mean(dim=(2, 3) if per_frame else (1, 2, 3))
+            return self.lin(pooled)
 
     return ProtoNet(_Enc(), encoder_batch_size=3)
 
 
-def test_streaming_step_matches_classic_step() -> None:
+@pytest.mark.parametrize('per_frame', [False, True])
+def test_streaming_step_matches_classic_step(per_frame: bool) -> None:
     '''Streaming grad-accum must match a full-batch backward step: same loss,
-    same accuracy, same post-step parameters (CPU / fp32).'''
+    same accuracy, same post-step parameters (CPU / fp32). Holds for BatchNorm-free
+    encoders only — with BatchNorm the two paths normalise different batches.'''
     from src.training.meta_trainer import _train_step_streaming  # noqa: PLC0415
 
     tensors = _mini_episode()
     device = torch.device('cpu')
 
-    model_stream = _build_protonet()
+    model_stream = _build_protonet(per_frame)
     opt_stream = torch.optim.SGD(model_stream.parameters(), lr=0.1)
     loss_s, acc_s = _train_step_streaming(
         model_stream, tensors, n_way=2, optimizer=opt_stream,
         scaler=None, use_amp=False, device=device,
     )
 
-    model_classic = _build_protonet()
+    model_classic = _build_protonet(per_frame)
     opt_classic = torch.optim.SGD(model_classic.parameters(), lr=0.1)
     opt_classic.zero_grad(set_to_none=True)
     out = model_classic(
@@ -457,7 +505,7 @@ def test_run_training_resume_continues_from_last(
         'src.training.meta_trainer.ThetisDataset',
         lambda *a, **kw: _SyntheticDataset(df_full, modality='rgb'),
     )
-    monkeypatch.setattr('src.training.meta_trainer.VideoEncoder', lambda **_kw: _ToyEncoder())
+    monkeypatch.setattr('src.models.factory.VideoEncoder', lambda **_kw: _ToyEncoder())
 
     ckpt_dir = tmp_path / 'outputs' / 'checkpoints' / 'unittest_resume'
 
@@ -496,7 +544,7 @@ def test_run_training_resume_missing_explicit_checkpoint_raises(
         'src.training.meta_trainer.ThetisDataset',
         lambda *a, **kw: _SyntheticDataset(df_full, modality='rgb'),
     )
-    monkeypatch.setattr('src.training.meta_trainer.VideoEncoder', lambda **_kw: _ToyEncoder())
+    monkeypatch.setattr('src.models.factory.VideoEncoder', lambda **_kw: _ToyEncoder())
 
     with pytest.raises(FileNotFoundError):
         run_training(

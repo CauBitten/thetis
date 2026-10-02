@@ -1,4 +1,4 @@
-'''Tests for src/models/{protonet, encoders}.py.
+'''Tests for src/models/{protonet, encoders, factory}.py.
 
 The ProtoNet head is tested with a tiny synthetic encoder so we don't depend on
 torchvision weights. Encoder tests are guarded behind ``torchvision`` import
@@ -11,7 +11,17 @@ import pytest
 import torch
 from torch import nn
 
-from src.models.encoders import KINETICS_MEAN, KINETICS_STD, preprocess_video_batch
+from src.models.base import EpisodicModel
+from src.models.encoders import (
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+    KINETICS_MEAN,
+    KINETICS_STD,
+    FrameEncoder,
+    VideoEncoder,
+    preprocess_video_batch,
+)
+from src.models.factory import METHODS, build_encoder, build_model
 from src.models.protonet import ProtoNet
 
 
@@ -34,6 +44,12 @@ def test_preprocess_float_in_zero_one() -> None:
     x = torch.ones((1, 2, 4, 4, 3), dtype=torch.float32)
     y = preprocess_video_batch(x)
     expected = torch.tensor([(1.0 - m) / s for m, s in zip(KINETICS_MEAN, KINETICS_STD)]).view(1, 3, 1, 1, 1)
+    assert torch.allclose(y, expected.expand_as(y), atol=1e-6)
+
+
+def test_preprocess_custom_stats() -> None:
+    y = preprocess_video_batch(torch.zeros((1, 2, 4, 4, 3), dtype=torch.uint8), mean=IMAGENET_MEAN, std=IMAGENET_STD)
+    expected = torch.tensor([-m / s for m, s in zip(IMAGENET_MEAN, IMAGENET_STD)]).view(1, 3, 1, 1, 1)
     assert torch.allclose(y, expected.expand_as(y), atol=1e-6)
 
 
@@ -99,7 +115,8 @@ def test_protonet_perfect_accuracy_on_separable_episode(tiny_protonet: ProtoNet)
     out = tiny_protonet(support, query, support_labels, query_labels, n_way=5)
     assert out['logits'].shape == (5 * 15, 5)
     assert out['preds'].shape == (5 * 15,)
-    assert out['prototypes'].shape == (5, 3)
+    prototypes = tiny_protonet.support_state(tiny_protonet.encoder(support), support_labels, n_way=5)
+    assert prototypes.shape == (5, 3)
     assert out['accuracy'] == pytest.approx(1.0, abs=1e-6)
     assert torch.isfinite(out['loss']).item()
 
@@ -150,3 +167,99 @@ def test_protonet_determinism_same_seed() -> None:
     out_b = model_b(s, q, sl, ql, n_way=3)
     assert torch.equal(out_a['preds'], out_b['preds'])
     assert torch.allclose(out_a['logits'], out_b['logits'])
+
+
+# ---------------------------------------------------------------------------
+# ProtoNet on per-frame features
+# ---------------------------------------------------------------------------
+
+
+class _PerFrameEncoder(nn.Module):
+    '''``(B, T, H, W, 3)`` → ``(B, T, 3)``: per-frame mean colour.'''
+
+    per_frame = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.to(torch.float32).mean(dim=(2, 3))
+
+
+def test_protonet_averages_per_frame_features_over_time() -> None:
+    support, query, support_labels, query_labels = _episode_tensors(n_way=3, k_shot=2, q_query=4, seed=1)
+    out_frames = ProtoNet(_PerFrameEncoder())(support, query, support_labels, query_labels, n_way=3)
+    out_clip = ProtoNet(_IdentityVideoEncoder())(support, query, support_labels, query_labels, n_way=3)
+    assert torch.allclose(out_frames['logits'], out_clip['logits'], atol=1e-4)
+
+
+def test_protonet_rejects_bad_embedding_rank() -> None:
+    class _Bad(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x.to(torch.float32)  # (B, T, H, W, 3) — not an embedding
+
+    support, query, support_labels, query_labels = _episode_tensors(n_way=2, k_shot=1, q_query=1)
+    with pytest.raises(ValueError, match='encoder must return'):
+        ProtoNet(_Bad())(support, query, support_labels, query_labels, n_way=2)
+
+
+# ---------------------------------------------------------------------------
+# FrameEncoder (random init, no download)
+# ---------------------------------------------------------------------------
+
+
+def test_frame_encoder_keeps_time_axis() -> None:
+    torch.manual_seed(0)
+    enc = FrameEncoder(name='resnet18', pretrained=False)
+    out = enc(torch.randint(0, 256, (2, 3, 32, 32, 3), dtype=torch.uint8))
+    assert enc.per_frame and enc.embed_dim == 512
+    assert out.shape == (2, 3, 512)
+
+
+def test_frame_encoder_checkpointing_matches_plain_forward() -> None:
+    torch.manual_seed(0)
+    enc = FrameEncoder(name='resnet18', pretrained=False)
+    x = torch.randint(0, 256, (2, 2, 32, 32, 3), dtype=torch.uint8)
+    plain = enc(x)
+    enc.use_checkpointing = True
+    ckpt = enc(x)
+    assert torch.allclose(plain, ckpt, atol=1e-5)
+    ckpt.sum().backward()
+    assert enc.backbone.conv1.weight.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+
+def test_build_encoder_dispatches_on_name() -> None:
+    assert isinstance(build_encoder({'name': 'resnet18'}, pretrained=False), FrameEncoder)
+    assert isinstance(build_encoder({'name': 'r3d_18'}, pretrained=False), VideoEncoder)
+    with pytest.raises(ValueError, match='unknown encoder.name'):
+        build_encoder({'name': 'vit_b_16'}, pretrained=False)
+
+
+def test_build_model_protonet() -> None:
+    model = build_model({'method': 'protonet'}, _IdentityVideoEncoder(), encoder_batch_size=4)
+    assert isinstance(model, ProtoNet)
+    assert model.encoder_batch_size == 4
+
+
+def test_build_model_rejects_unknown_method() -> None:
+    with pytest.raises(NotImplementedError, match='not_a_method'):
+        build_model({'method': 'not_a_method'}, _IdentityVideoEncoder())
+
+
+class _FrameHead(EpisodicModel):
+    needs_frame_features = True
+
+    def __init__(self, encoder: nn.Module, encoder_batch_size: int | None = None, scale: float = 1.0) -> None:
+        super().__init__(encoder, encoder_batch_size)
+        self.scale = scale
+
+
+def test_build_model_checks_frame_features_and_forwards_kwargs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(METHODS, 'frame_head', _FrameHead)
+    cfg = {'method': 'frame_head', 'model': {'scale': 2.5}}
+    with pytest.raises(ValueError, match='per-frame'):
+        build_model(cfg, _IdentityVideoEncoder())
+    model = build_model(cfg, _PerFrameEncoder())
+    assert isinstance(model, _FrameHead) and model.scale == 2.5

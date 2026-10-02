@@ -6,13 +6,15 @@ pelo código escritas explicitamente — nada fica no default implícito. Isso �
 que garante que a diferença de resultado entre duas runs venha da modalidade ou
 do K, e não do hardware onde rodou.
 
-Entre dois configs quaisquer, só três coisas mudam: `run_id`, `modalities` e
-`episode.k_shot`.
+Entre dois configs do mesmo método, só três coisas mudam: `run_id`,
+`modalities` e `episode.k_shot`. Entre métodos, muda só o que é do método
+(`method`, `encoder.name`, `model` e a amostragem temporal); splits, episódios,
+seed, otimizador e avaliação são os mesmos — ver "TRX" abaixo.
 
 ## Convenção de nomes
 
 ```text
-protonet_<modalidade>_5w<K>s.yaml      →   run_id = protonet_<modalidade>_5w<K>s
+<método>_<modalidade>_5w<K>s.yaml      →   run_id = <método>_<modalidade>_5w<K>s
 ```
 
 A modalidade no nome do arquivo vai sem underscore (`skeleton2d`), enquanto o
@@ -20,7 +22,7 @@ valor em `modalities:` usa o identificador do código (`skeleton_2d`).
 
 O `run_id` fixo define `outputs/checkpoints/<run_id>/` e
 `experiments/logs/<run_id>/`. É o que faz `--resume` funcionar pela CLI: sem
-ele, o trainer gera `protonet_<mod>_<k>s_<timestamp>` e cada invocação cria um
+ele, o trainer gera `<method>_<mod>_<k>s_<timestamp>` e cada invocação cria um
 diretório novo, onde o `last.pt` nunca é encontrado. Como contrapartida,
 **re-rodar o mesmo config sobrescreve a run anterior** — para variar
 hiperparâmetros, copie o arquivo com outro nome (e outro `run_id`). O notebook
@@ -35,6 +37,9 @@ do Kaggle sobrescreve `cfg["run_id"]` depois de carregar, então não é afetado
 | `mask` | `protonet_mask_5w1s.yaml` | `protonet_mask_5w5s.yaml` |
 | `skeleton_2d` | `protonet_skeleton2d_5w1s.yaml` | `protonet_skeleton2d_5w5s.yaml` |
 | `skeleton_3d` | `protonet_skeleton3d_5w1s.yaml` | `protonet_skeleton3d_5w5s.yaml` |
+
+Os 10 do TRX seguem o mesmo padrão, com prefixo `trx_` (`trx_rgb_5w1s.yaml`,
+…, `trx_skeleton3d_5w5s.yaml`).
 
 Arquivos com prefixo `_` (`_kaggle_active.yaml`) são derivados gerados pelo
 notebook — não edite à mão.
@@ -211,8 +216,9 @@ diretório nenhuma delas é omitida.
 
 | Chave | Default | Efeito |
 | --- | --- | --- |
-| `method` | — (obrigatória) | Só `protonet` é implementado (`meta_trainer.py:75`). |
-| `run_id` | `protonet_<mod>_<k>s_<timestamp>` | Nome dos diretórios de checkpoint e log. Ver acima. |
+| `method` | — (obrigatória) | Cabeça few-shot, registrada em `METHODS` (`src/models/factory.py`). Hoje: `protonet`, `trx`. |
+| `model` | `{}` | Hiperparâmetros do método, repassados como kwargs ao construtor da cabeça. O ProtoNet não tem nenhum; os do TRX estão em "TRX" abaixo. |
+| `run_id` | `<method>_<mod>_<k>s_<timestamp>` | Nome dos diretórios de checkpoint e log. Ver acima. |
 | `modalities` | — (obrigatória) | Lista de 1 elemento; a Fase 2 aceita uma modalidade por config. Válidos: `rgb`, `depth`, `mask`, `skeleton_2d`, `skeleton_3d`. |
 | `seed` | — (obrigatória) | Semente de NumPy/Torch/CUDA e do sampler de episódios. |
 | `output_root` | `outputs` | Raiz dos checkpoints. Os notebooks sobrescrevem. |
@@ -222,13 +228,13 @@ diretório nenhuma delas é omitida.
 
 | Chave | Default | Efeito |
 | --- | --- | --- |
-| `name` | `r2plus1d_18` | Backbone de vídeo (torchvision). |
-| `pretrained` | `true` | Pesos Kinetics-400. Ignorado em `--smoke` (usa peso aleatório). |
+| `name` | `r2plus1d_18` | Backbone (torchvision). **Vídeo**, devolve `(B, D)`: `r2plus1d_18`, `r3d_18`. **Por frame**, devolve `(B, T, D)`: `resnet18`, `resnet34` (D=512), `resnet50` (D=2048, o do TRX). Métodos que comparam frames (TRX) exigem um encoder por frame; o ProtoNet aceita os dois (faz a média no tempo). |
+| `pretrained` | `true` | Pesos Kinetics-400 (vídeo) ou ImageNet `IMAGENET1K_V1` (por frame). Ignorado em `--smoke` (usa peso aleatório). |
 | `batch_size` | auto por VRAM | Quantos vídeos passam pelo encoder por forward (encoding em chunks). Knob de OOM **e hiperparâmetro de treino** — ver abaixo. |
-| `gradient_checkpointing` | auto: só liga em GPU ≤6 GB | Recomputa ativações no backward: ~70% menos VRAM de ativação, ~25-30% mais lento por step. Não altera o resultado. |
+| `gradient_checkpointing` | auto: só liga em GPU ≤6 GB | Recomputa ativações no backward: ~70% menos VRAM de ativação, ~25-30% mais lento por step. **Altera o resultado** (estatísticas do BatchNorm) — faz parte do protocolo, ver abaixo. |
 
-**`encoder.batch_size` não é um knob puramente de memória.** O `ProtoNet._encode`
-fatia o lote em chunks desse tamanho (`src/models/protonet.py:62-65`), e o
+**`encoder.batch_size` não é um knob puramente de memória.** O `EpisodicModel._encode`
+fatia o lote em chunks desse tamanho (`src/models/base.py:74-75`), e o
 R(2+1)D-18 tem **37 camadas `BatchNorm3d`** sem congelamento. Em `model.train()`
 cada chunk é normalizado pelas **próprias estatísticas**, então o tamanho do
 chunk muda as ativações, os gradientes e os `running_mean/var` que depois são
@@ -240,9 +246,11 @@ usados na avaliação. Medido com o mesmo lote e a mesma seed:
 | `eval()` | 0.000 |
 
 Ou seja: **duas runs com `batch_size` diferente não são comparáveis**, mesmo com
-tudo o mais idêntico. Por isso os configs fixam `16` explicitamente e **o
-notebook do Kaggle não sobrescreve mais esse valor** — ele faz parte do
-protocolo experimental, não da configuração da máquina.
+tudo o mais idêntico. Nos encoders por frame vale o mesmo: as `BatchNorm2d` da
+ResNet normalizam os `batch_size × frame_count` frames de cada chunk. Por isso
+os configs fixam `16` explicitamente e **o notebook do Kaggle não sobrescreve
+esse valor** — ele faz parte do protocolo experimental, não da configuração da
+máquina.
 
 `16` foi escolhido por ser o valor que roda em T4/P100/L4 (as GPUs de fato
 usadas) com `gradient_checkpointing` e `stream_query` ligados. Numa GPU menor que
@@ -259,8 +267,23 @@ daqui omite) escolheria:
 | ≤ 16 GB | 16 |
 | > 16 GB | 32 |
 
-Se precisar de folga de memória, mexa antes em `gradient_checkpointing` e
-`optim.stream_query`: os dois reduzem o pico de VRAM **sem alterar o resultado**.
+**`encoder.gradient_checkpointing` e `optim.stream_query` também fazem parte do
+protocolo.** Os dois reduzem o pico de VRAM, mas, como os encoders têm
+BatchNorm sem congelamento, nenhum deles é neutro:
+
+- **`gradient_checkpointing`**: o backward re-executa o forward de cada estágio
+  em modo treino, e cada BatchNorm atualiza `running_mean/var` **duas vezes por
+  passo** (`num_batches_tracked` sobe 2 por step). As ativações e os gradientes
+  do treino não mudam, mas as estatísticas que a avaliação usa, sim.
+- **`stream_query`**: o suporte passa pelo encoder num lote só e a query em
+  micro-batches de `batch_size`; desligado, suporte e query são concatenados e
+  fatiados em chunks mistos. Muda a composição dos lotes do BatchNorm e, com
+  ela, as ativações, a loss e os gradientes. A equivalência exata do streaming
+  testada em `tests/test_training.py` só vale para encoders sem BatchNorm.
+
+Todos os configs fixam os dois em `true`, e as runs do ProtoNet foram feitas
+assim. Se faltar VRAM, **não desligue nenhum dos dois nem baixe `batch_size`
+num config só**: treine numa GPU maior, ou mude em todos e re-rode a comparação.
 
 ### Histórico de runs anteriores a esta padronização
 
@@ -297,7 +320,7 @@ com partição 6/3/3 — ver a seção "Splits" do README raiz.
 | `weight_decay` | `0.0` | Weight decay do Adam. |
 | `eval_every` | `5` | Intervalo (em épocas) da validação episódica. |
 | `fp16` | `true` em CUDA | Autocast AMP; ~metade da VRAM de ativação. Ignorado na CPU. |
-| `stream_query` | `true` em CUDA | Processa o conjunto de query em micro-batches com acumulação de gradiente; limita o pico de VRAM. |
+| `stream_query` | `true` em CUDA | Processa o conjunto de query em micro-batches com acumulação de gradiente; limita o pico de VRAM. Muda a composição dos lotes do BatchNorm, então faz parte do protocolo (ver `encoder`). |
 | `cuda_memory_fraction` | `0.92` | Teto da fração de VRAM por processo. Faz o OOM falhar rápido no limite real em vez de vazar para a RAM compartilhada (relevante no Windows). Não está escrito nos configs; ajuste só se precisar. |
 
 ### `data`
@@ -307,7 +330,9 @@ com partição 6/3/3 — ver a seção "Splits" do README raiz.
 | `manifest_path` | — (obrigatória) | `data/processed/manifest.csv`, gerado por `make preprocess`. |
 | `dataset_root` | — (obrigatória) | Raiz dos `VIDEO_*` do THETIS. |
 | `train_classes` / `val_classes` / `test_classes` | `6` / `3` / `3` | Partição das 12 classes; disjunta por construção. |
-| `frame_count` | `16` | Frames por clipe após o crop temporal. O dataset decodifica `2×` isso e o `RandomTemporalCrop` reduz. |
+| `frame_count` | `16` | Frames por clipe que entram no encoder. No treino o dataset decodifica `temporal_oversample×` isso e o passo temporal reduz; na avaliação decodifica exatamente `frame_count`, uniforme no clipe inteiro. |
+| `temporal_sampling` | `crop` | Passo temporal do treino: `crop` (`RandomTemporalCrop`, janela contígua) ou `segment` (`RandomSegmentSample`, um frame aleatório por segmento, estilo TSN). Não afeta a avaliação. Ver o parágrafo `data.temporal_sampling` abaixo. |
+| `temporal_oversample` | `2` | Fator de sobre-decodificação do treino (`frame_count × fator` frames). Com `segment`, define quantos frames candidatos cada segmento tem. |
 | `resize_size` | `128` | Lado menor após resize, antes do crop. |
 | `spatial_size` | `112` | Lado do crop final que entra no encoder. |
 | `cache_decoded` | `true` | Decodifica cada clipe uma vez, redimensiona para `resize_size` e serve da RAM. |
@@ -319,18 +344,78 @@ GPU — é o gargalo real. Cachear custa ~1,9 GB de RAM a 128² (contra ~29 MB p
 clipe em 480×640 nativo) e não muda o resultado: o resize do cache é o mesmo
 `ResizeVideo` do transform. Desligue só se estiver limitado de RAM.
 
+**`data.temporal_sampling`.** Com `crop` (o default e o que os 10 configs do
+ProtoNet usaram), o treino decodifica `2 × frame_count` frames espalhados pelo
+clipe e recorta uma janela contígua de `frame_count`: o modelo vê metade do golpe,
+em meia velocidade em relação ao que vê na avaliação, que cobre o clipe inteiro.
+`segment` divide o clipe em `frame_count` segmentos e sorteia um frame em cada,
+então o treino sempre cobre o golpe inteiro, como no TSN e no TRX. A avaliação é
+a mesma nos dois modos (sem passo temporal; `frame_count` frames uniformes no
+clipe inteiro), então, com a mesma `seed`, os episódios de meta-teste e a regra de
+amostragem dos frames são os mesmos, e os números de teste continuam comparáveis
+entre métodos treinados com `crop` e com `segment`. O que muda é só a
+augmentation temporal do treino — registre o modo usado ao comparar resultados.
+Para `segment`, use `temporal_oversample: 4` (com `frame_count: 8` são 32 frames
+decodificados, o mesmo custo de cache do ProtoNet com 16 × 2).
+
+## TRX
+
+Implementação em `src/models/trx.py`, portada do código dos autores
+(github.com/tobyperrett/trx) e conferida contra ele em
+`tests/test_trx.py::test_trx_matches_reference_implementation`.
+
+### `model` (chaves do TRX)
+
+| Chave | Default | Efeito |
+| --- | --- | --- |
+| `temporal_set_sizes` | `[2, 3]` | Cardinalidades Ω das tuplas de frames; um ramo por valor, logits na média. Com `frame_count: 8` são `C(8,2) + C(8,3) = 28 + 56` tuplas. |
+| `d_model` | `1152` | Tamanho das chaves e valores (`trans_linear_out_dim` do artigo). |
+| `dropout` | `0.1` | Dropout após o positional encoding. |
+| `pe_scale` | `0.1` | Amplitude do positional encoding senoidal. |
+
+O TRX exige um encoder por frame (`encoder.name` = `resnet18/34/50`); com um
+encoder de vídeo, o `build_model` falha no início da run.
+
+### O que difere do ProtoNet nos configs
+
+| Chave | ProtoNet | TRX | Por quê |
+| --- | --- | --- | --- |
+| `encoder.name` | `r2plus1d_18` (Kinetics) | `resnet50` (ImageNet, por frame) | Backbone do artigo; o TRX precisa do eixo temporal. |
+| `data.frame_count` | `16` | `8` | Como no artigo; com 16 seriam 680 tuplas e a atenção cresceria ~70×. |
+| `data.temporal_sampling` | `crop` | `segment` | Como no artigo. Não afeta a avaliação (ver `data.temporal_sampling`). |
+| `data.temporal_oversample` | `2` | `4` | 32 frames decodificados, o mesmo custo de cache. |
+
+### O que difere do artigo
+
+Para manter o protocolo comum a todos os métodos, os configs do TRX **não**
+reproduzem o treino do artigo em três pontos:
+
+- **Resolução 112² em vez de 224²** — a mesma entrada do ProtoNet, e ~4× mais
+  barato. A ResNet-50 da ImageNet termina num mapa 4×4 em vez de 7×7.
+- **Adam (lr 1e-4), um episódio por passo** — o código oficial usa SGD
+  (lr 1e-3) acumulando o gradiente de 16 episódios.
+- **15 consultas por classe e 3-way em val/test** — o split 6/3/3 do THETIS.
+
+Como o backbone também muda (ResNet-50 ImageNet contra R(2+1)D-18 Kinetics), a
+diferença TRX × ProtoNet mistura o efeito da cabeça com o do backbone. Para
+isolar a cabeça, dá para rodar o ProtoNet sobre o mesmo encoder: um config com
+`method: protonet` e o `encoder`/`data` do TRX (o ProtoNet faz a média das
+features por frame — é o baseline do próprio artigo do TRX).
+
 ## Limitações conhecidas
 
 Registradas aqui porque afetam a leitura dos resultados, mas são comportamento
 atual do código e não configuráveis:
 
-- **Normalização Kinetics em todas as modalidades.** As estatísticas de
-  normalização são as do Kinetics-400 RGB e são aplicadas a qualquer modalidade
-  (`src/models/encoders.py:26,57-59`), inclusive `depth`, `mask` e os vídeos de
+- **Normalização RGB em todas as modalidades.** As estatísticas de
+  normalização são as do Kinetics-400 RGB (encoders de vídeo) ou da ImageNet
+  (encoders por frame) e são aplicadas a qualquer modalidade
+  (`src/models/encoders.py:29-33,69-71`), inclusive `depth`, `mask` e os vídeos de
   esqueleto, que não são RGB natural. O mesmo vale para `encoder.pretrained`.
-- **Augmentation fixa no código.** `build_train_transform`
-  (`src/training/meta_trainer.py:215-226`) não lê parâmetros do config:
-  `RandomTemporalCrop → ResizeVideo → RandomSpatialCrop → HorizontalFlip(p=0.5)
+- **Augmentation fixa no código.** Fora o passo temporal
+  (`data.temporal_sampling`), `build_train_transform`
+  (`src/training/meta_trainer.py:228-250`) não lê parâmetros do config:
+  `<passo temporal> → ResizeVideo → RandomSpatialCrop → HorizontalFlip(p=0.5)
   → ColorJitter(0.2/0.2/0.2)`. Consequências: `ColorJitter` é praticamente
   inócuo em `mask` (silhueta binária), e `HorizontalFlip` inverte a lateralidade
   do golpe em todas as modalidades.

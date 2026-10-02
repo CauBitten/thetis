@@ -3,70 +3,40 @@
 Given a single episode with ``N`` classes, ``K`` support samples per class and
 ``Q`` query samples per class, the head:
 
-1. encodes support and query in one forward pass (``encoder(...)`` → ``(N*(K+Q), D)``);
+1. encodes support and query (``encoder(...)`` → ``(N*(K+Q), D)``);
 2. averages each class's K support embeddings → prototypes ``(N, D)``;
 3. classifies each query by ``-‖q - c_i‖²`` as logits (negative squared L2);
 4. cross-entropy against ``[0, N)`` labels.
 
-The encoder is decoupled — pass any ``nn.Module`` that maps
-``(B, T, H, W, 3)`` videos to ``(B, D)`` embeddings (e.g.
-:class:`src.models.encoders.VideoEncoder`). Tests inject a tiny dummy.
+Steps 2 and 3 are :meth:`ProtoNet.support_state` and
+:meth:`ProtoNet.query_logits`; the episode plumbing lives in
+:class:`src.models.base.EpisodicModel`. Clip-level ``(B, D)`` embeddings are
+used as is; per-frame ``(B, T, D)`` ones (from
+:class:`src.models.encoders.FrameEncoder`) are averaged over ``T`` first —
+the ProtoNet baseline of the TRX paper.
 '''
 from __future__ import annotations
 
-from typing import TypedDict
-
 import torch
-from torch import nn
-from torch.nn import functional as F
+
+from src.models.base import EpisodicModel
 
 
-class ProtoNetOutput(TypedDict):
-    logits: torch.Tensor   # (N*Q, N)
-    loss: torch.Tensor     # scalar
-    accuracy: float        # scalar in [0, 1]
-    preds: torch.Tensor    # (N*Q,) int64
-    prototypes: torch.Tensor  # (N, D)
-
-
-class ProtoNet(nn.Module):
-    '''ProtoNet head wrapping an arbitrary video encoder.
-
-    Args:
-        encoder: ``nn.Module`` with ``forward(x: (B, T, H, W, 3)) -> (B, D)``.
-
-    Call signature:
-        ``forward(support, query, support_labels, query_labels, n_way)`` where
-        ``support`` is ``(N*K, T, H, W, 3)``, ``query`` is ``(N*Q, T, H, W, 3)``,
-        and labels are int tensors in ``[0, N)``. Returns a :class:`ProtoNetOutput`
-        dict so callers can choose to backprop on ``loss`` and log ``accuracy``.
-    '''
-
-    def __init__(self, encoder: nn.Module, encoder_batch_size: int | None = None) -> None:
-        super().__init__()
-        self.encoder = encoder
-        self.encoder_batch_size = encoder_batch_size
-
-    def _encode(self, videos: torch.Tensor, encoder_batch_size: int | None = None) -> torch.Tensor:
-        '''Encode ``(B, T, H, W, 3)`` → ``(B, D)``, optionally in chunks.
-
-        Chunking caps the *transient* forward footprint, but under autograd each
-        chunk's activation graph is retained until backward — so this only bounds
-        peak memory in ``no_grad`` (eval). The training loop streams support/query
-        with gradient accumulation instead (see
-        ``meta_trainer._train_step_streaming``).
-        '''
-        batch_size = encoder_batch_size if encoder_batch_size is not None else self.encoder_batch_size
-        if batch_size is None or batch_size >= videos.shape[0]:
-            return self.encoder(videos)
-        chunks: list[torch.Tensor] = []
-        for start in range(0, videos.shape[0], batch_size):
-            chunks.append(self.encoder(videos[start : start + batch_size]))
-        return torch.cat(chunks, dim=0)
+class ProtoNet(EpisodicModel):
+    '''ProtoNet head wrapping an arbitrary video encoder (clip-level or per-frame).'''
 
     @staticmethod
-    def _prototypes(support_emb: torch.Tensor, support_labels: torch.Tensor, n_way: int) -> torch.Tensor:
-        '''Per-class mean of the support embeddings → ``(n_way, D)``.'''
+    def _pool(emb: torch.Tensor) -> torch.Tensor:
+        '''``(B, D)`` as is; ``(B, T, D)`` averaged over frames.'''
+        if emb.ndim == 3:
+            return emb.mean(dim=1)
+        if emb.ndim != 2:
+            raise ValueError(f'encoder must return (B, D) or (B, T, D); got shape {tuple(emb.shape)}')
+        return emb
+
+    def support_state(self, support_emb: torch.Tensor, support_labels: torch.Tensor, n_way: int) -> torch.Tensor:
+        '''Per-class mean of the support embeddings → prototypes ``(n_way, D)``.'''
+        support_emb = self._pool(support_emb)
         embed_dim = support_emb.shape[1]
         prototypes = torch.zeros(n_way, embed_dim, device=support_emb.device, dtype=support_emb.dtype)
         for c in range(n_way):
@@ -76,8 +46,7 @@ class ProtoNet(nn.Module):
             prototypes[c] = support_emb[mask].mean(dim=0)
         return prototypes
 
-    @staticmethod
-    def _logits(query_emb: torch.Tensor, prototypes: torch.Tensor) -> torch.Tensor:
+    def query_logits(self, query_emb: torch.Tensor, prototypes: torch.Tensor) -> torch.Tensor:
         '''Negative squared L2 distance ``(N*Q, N)``, forced to fp32.
 
         Under AMP the embeddings are fp16 and a sum of ``D`` squared differences
@@ -85,53 +54,12 @@ class ProtoNet(nn.Module):
         distance with autocast disabled keeps the logits/softmax numerically safe
         at negligible (few-KB) memory cost.
         '''
+        query_emb = self._pool(query_emb)
         with torch.autocast(device_type=query_emb.device.type, enabled=False):
             q = query_emb.float().unsqueeze(1)   # (N*Q, 1, D)
             p = prototypes.float().unsqueeze(0)  # (1, N, D)
             diffs = q - p
             return -(diffs * diffs).sum(dim=-1)  # (N*Q, N)
 
-    def forward(
-        self,
-        support: torch.Tensor,
-        query: torch.Tensor,
-        support_labels: torch.Tensor,
-        query_labels: torch.Tensor,
-        n_way: int,
-        encoder_batch_size: int | None = None,
-    ) -> ProtoNetOutput:
-        if support.ndim != 5 or query.ndim != 5:
-            raise ValueError(
-                f'expected (B,T,H,W,3) tensors; got support={tuple(support.shape)}, query={tuple(query.shape)}'
-            )
-        n_support = support.shape[0]
-        n_query = query.shape[0]
-        if support_labels.shape != (n_support,):
-            raise ValueError(f'support_labels shape {tuple(support_labels.shape)} != ({n_support},)')
-        if query_labels.shape != (n_query,):
-            raise ValueError(f'query_labels shape {tuple(query_labels.shape)} != ({n_query},)')
 
-        combined = torch.cat([support, query], dim=0)
-        embeddings = self._encode(combined, encoder_batch_size)
-        if embeddings.ndim != 2:
-            raise ValueError(f'encoder must return (B, D); got shape {tuple(embeddings.shape)}')
-
-        support_emb = embeddings[:n_support]
-        query_emb = embeddings[n_support:]
-
-        prototypes = self._prototypes(support_emb, support_labels, n_way)
-        logits = self._logits(query_emb, prototypes)
-        loss = F.cross_entropy(logits, query_labels)
-        preds = logits.argmax(dim=-1)
-        accuracy = float((preds == query_labels).float().mean().item())
-
-        return {
-            'logits': logits,
-            'loss': loss,
-            'accuracy': accuracy,
-            'preds': preds,
-            'prototypes': prototypes,
-        }
-
-
-__all__ = ['ProtoNet', 'ProtoNetOutput']
+__all__ = ['ProtoNet']
