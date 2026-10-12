@@ -2,9 +2,11 @@
 
 A head scores an episode in two steps, so the trainer can stream the query set:
 
-1. ``support_state(support_emb, support_labels, n_way)`` — everything that
-   depends only on the support set (ProtoNet: class prototypes; TRX: the
-   support frame features grouped by class);
+1. ``support_state(support_emb, support_labels, n_way, class_names)`` —
+   everything that depends only on the support set (ProtoNet: class
+   prototypes; TRX: the support frame features grouped by class; MVP-Shot:
+   prototypes built with the class-name text). ``class_names[i]`` is the
+   canonical label of episode class ``i``; heads that do not use text ignore it;
 2. ``query_logits(query_emb, state)`` — ``(n_query, n_way)`` logits for any
    slice of the query set. Each query is scored independently of the others,
    which is what makes the micro-batched backward of
@@ -18,6 +20,7 @@ which one it needs via :attr:`EpisodicModel.needs_frame_features`.
 '''
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, TypedDict
 
 import torch
@@ -42,7 +45,7 @@ class EpisodicModel(nn.Module):
             videos per encoder call (see :meth:`_encode`).
 
     Call signature:
-        ``forward(support, query, support_labels, query_labels, n_way)`` where
+        ``forward(support, query, support_labels, query_labels, n_way, class_names=None)`` where
         ``support`` is ``(N*K, T, H, W, 3)``, ``query`` is ``(N*Q, T, H, W, 3)``,
         and labels are int tensors in ``[0, N)``. Returns an
         :class:`EpisodeOutput` dict so callers can choose to backprop on
@@ -75,7 +78,13 @@ class EpisodicModel(nn.Module):
             chunks.append(self.encoder(videos[start : start + batch_size]))
         return torch.cat(chunks, dim=0)
 
-    def support_state(self, support_emb: torch.Tensor, support_labels: torch.Tensor, n_way: int) -> Any:
+    def support_state(
+        self,
+        support_emb: torch.Tensor,
+        support_labels: torch.Tensor,
+        n_way: int,
+        class_names: Sequence[str] | None = None,
+    ) -> Any:
         '''Everything the head precomputes from the support set alone.'''
         raise NotImplementedError
 
@@ -91,6 +100,7 @@ class EpisodicModel(nn.Module):
         query_labels: torch.Tensor,
         n_way: int,
         encoder_batch_size: int | None = None,
+        class_names: Sequence[str] | None = None,
     ) -> EpisodeOutput:
         if support.ndim != 5 or query.ndim != 5:
             raise ValueError(
@@ -106,7 +116,7 @@ class EpisodicModel(nn.Module):
         combined = torch.cat([support, query], dim=0)
         embeddings = self._encode(combined, encoder_batch_size)
 
-        state = self.support_state(embeddings[:n_support], support_labels, n_way)
+        state = self.support_state(embeddings[:n_support], support_labels, n_way, class_names)
         logits = self.query_logits(embeddings[n_support:], state)
         loss = F.cross_entropy(logits, query_labels)
         preds = logits.argmax(dim=-1)

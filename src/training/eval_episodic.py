@@ -178,6 +178,7 @@ def run_eval(
                 tensors['support_labels'],
                 tensors['query_labels'],
                 n_way=int(ep.get('n_way', n_way)),
+                class_names=tensors['classes'],
             )
             accs.append(out['accuracy'])
             # Map local (episode) class indices back to canonical class labels

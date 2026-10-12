@@ -1,0 +1,58 @@
+# MVP-Shot · rgb · 5-way 1-shot (meta_val/meta_test rodam 3-way; split 6/3/3).
+# Vídeo RGB nativo (cobertura 100%: 165 clipes/classe).
+# Documentação de todas as chaves: experiments/configs/README.md
+method: mvp_shot
+run_id: mvp_shot_rgb_5w1s
+
+modalities:
+  - rgb
+
+encoder:
+  name: clip_rn50              # CLIP ResNet-50 (OpenAI), por frame + texto (backbone do artigo)
+  pretrained: true
+  batch_size: 16
+  gradient_checkpointing: true
+
+model:                         # artigo (Qu et al. 2025); o que ele omite vem do CLIP-FSAR
+  n_scales: 3                  # velocidades: 8, 4 e 2 tokens
+  scale_weights: [1.0, 1.0, 1.0]  # α_n da Eq. 11 (não informados no artigo)
+  heads: 8
+  mlp_dim: 2048
+  attn_dropout: 0.2
+  ffn_dropout: 0.05
+  otam_lambda: 0.5
+  prompt_template: 'a photo of {}'
+
+episode:
+  n_way: 5
+  n_way_val: 3
+  n_way_test: 3
+  k_shot: 1
+  q_query: 15
+  episodes_per_epoch: 200
+  episodes_meta_val: 100
+  episodes_meta_test: 1000
+
+optim:
+  epochs: 50
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  eval_every: 5
+  fp16: true
+  stream_query: true
+
+data:
+  manifest_path: data/processed/manifest.csv
+  dataset_root: dataset
+  train_classes: 6
+  val_classes: 3
+  test_classes: 3
+  frame_count: 8               # como no artigo; divisível por 4 (3 velocidades)
+  resize_size: 128
+  spatial_size: 112            # o artigo usa 224; 112 mantém a entrada dos outros métodos
+  temporal_sampling: segment   # um frame por segmento, como no artigo
+  temporal_oversample: 4       # 32 frames decodificados por clipe
+  cache_decoded: true
+  exclude_defective: true      # pula clipes em branco e duplicatas byte a byte do THETIS
+
+seed: 42

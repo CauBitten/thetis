@@ -91,7 +91,7 @@ Thetis/
 │   │   ├── factory.py          # config → encoder + cabeça (registro METHODS)
 │   │   ├── protonet.py         # Baseline: Prototypical Networks
 │   │   ├── trx.py              # TRX (cross-attention temporal) — implementado
-│   │   ├── mvp_shot.py         # MVP-Shot (alinhamento multi-velocidade)
+│   │   ├── mvp_shot.py         # MVP-Shot (alinhamento multi-velocidade) — implementado
 │   │   ├── safsar.py           # SAFSAR (vídeo + texto)
 │   │   └── vpd.py              # Video Pose Distillation
 │   ├── training/
@@ -106,7 +106,8 @@ Thetis/
 │   ├── 02_episode_design.ipynb # Construção dos splits episódicos
 │   ├── 03_results.ipynb        # Análise comparativa entre métodos
 │   ├── kaggle_train_protonet.ipynb  # Meta-treino no Kaggle (5 modalidades × 1/5-shot, com --resume)
-│   └── kaggle_train_trx.ipynb       # Idem para o TRX (ResNet-50 por frame)
+│   ├── kaggle_train_trx.ipynb       # Idem para o TRX (ResNet-50 por frame)
+│   └── kaggle_train_mvp_shot.ipynb  # Idem para o MVP-Shot (CLIP ResNet-50 + texto)
 │
 ├── experiments/
 │   ├── configs/                # Um .yaml por experimento (método × modalidade × N × K)
@@ -277,6 +278,19 @@ ImageNet, por frame), `frame_count: 8` e a amostragem temporal do treino
 (`segment`). Os detalhes e o que difere do artigo estão na seção "TRX" de
 [`experiments/configs/README.md`](experiments/configs/README.md).
 
+### Meta-treinar o MVP-Shot
+
+```bash
+uv run python src/training/meta_trainer.py \
+    --config experiments/configs/mvp_shot_rgb_5w5s.yaml
+```
+
+Mesmo protocolo de dados do TRX (8 frames, `segment`, 112²), com backbone CLIP
+ResNet-50 e o nome da classe como texto no suporte. O primeiro uso baixa os
+pesos do CLIP via `open_clip_torch` (~390 MB). O artigo não publicou código: as
+escolhas que ele deixa em aberto estão na seção "MVP-Shot" de
+[`experiments/configs/README.md`](experiments/configs/README.md).
+
 Cada run grava, **a cada época**:
 
 - `outputs/checkpoints/<run_id>/last.pt` (modelo + optimizer + histórico) e `best.pt` (melhor val_acc)
@@ -306,8 +320,8 @@ RNG de augmentation reinicia).
 ### Treinar no Kaggle
 
 Quem não tem GPU local roda por `notebooks/kaggle_train_protonet.ipynb` (ou
-`notebooks/kaggle_train_trx.ipynb`, para o TRX), que clona este repositório,
-monta a config derivada e treina. Ele serve as cinco
+`kaggle_train_trx.ipynb` / `kaggle_train_mvp_shot.ipynb`), que clona este
+repositório, monta a config derivada e treina. Ele serve as cinco
 modalidades × {1-shot, 5-shot}: escolha `MODALITY` e `K_SHOT` na seção 1 e o
 resto do notebook se ajusta.
 
@@ -437,8 +451,8 @@ por combinação:
 | `skeleton_2d` | `protonet_skeleton2d_5w1s.yaml` | `protonet_skeleton2d_5w5s.yaml` |
 | `skeleton_3d` | `protonet_skeleton3d_5w1s.yaml` | `protonet_skeleton3d_5w5s.yaml` |
 
-O TRX tem os mesmos 10, com prefixo `trx_` (`trx_rgb_5w1s.yaml`, …,
-`trx_skeleton3d_5w5s.yaml`).
+O TRX e o MVP-Shot têm os mesmos 10, com prefixos `trx_` e `mvp_shot_`
+(`trx_rgb_5w1s.yaml`, …, `mvp_shot_skeleton3d_5w5s.yaml`).
 
 Cenários previstos:
 

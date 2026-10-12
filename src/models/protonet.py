@@ -17,6 +17,8 @@ the ProtoNet baseline of the TRX paper.
 '''
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 
 from src.models.base import EpisodicModel
@@ -34,8 +36,14 @@ class ProtoNet(EpisodicModel):
             raise ValueError(f'encoder must return (B, D) or (B, T, D); got shape {tuple(emb.shape)}')
         return emb
 
-    def support_state(self, support_emb: torch.Tensor, support_labels: torch.Tensor, n_way: int) -> torch.Tensor:
-        '''Per-class mean of the support embeddings → prototypes ``(n_way, D)``.'''
+    def support_state(
+        self,
+        support_emb: torch.Tensor,
+        support_labels: torch.Tensor,
+        n_way: int,
+        class_names: Sequence[str] | None = None,
+    ) -> torch.Tensor:
+        '''Per-class mean of the support embeddings → prototypes ``(n_way, D)``. ``class_names`` is unused.'''
         support_emb = self._pool(support_emb)
         embed_dim = support_emb.shape[1]
         prototypes = torch.zeros(n_way, embed_dim, device=support_emb.device, dtype=support_emb.dtype)

@@ -9,7 +9,7 @@ do K, e não do hardware onde rodou.
 Entre dois configs do mesmo método, só três coisas mudam: `run_id`,
 `modalities` e `episode.k_shot`. Entre métodos, muda só o que é do método
 (`method`, `encoder.name`, `model` e a amostragem temporal); splits, episódios,
-seed, otimizador e avaliação são os mesmos — ver "TRX" abaixo.
+seed, otimizador e avaliação são os mesmos — ver "TRX" e "MVP-Shot" abaixo.
 
 ## Convenção de nomes
 
@@ -38,8 +38,8 @@ do Kaggle sobrescreve `cfg["run_id"]` depois de carregar, então não é afetado
 | `skeleton_2d` | `protonet_skeleton2d_5w1s.yaml` | `protonet_skeleton2d_5w5s.yaml` |
 | `skeleton_3d` | `protonet_skeleton3d_5w1s.yaml` | `protonet_skeleton3d_5w5s.yaml` |
 
-Os 10 do TRX seguem o mesmo padrão, com prefixo `trx_` (`trx_rgb_5w1s.yaml`,
-…, `trx_skeleton3d_5w5s.yaml`).
+Os 10 do TRX e os 10 do MVP-Shot seguem o mesmo padrão, com prefixos `trx_` e
+`mvp_shot_` (`trx_rgb_5w1s.yaml`, …, `mvp_shot_skeleton3d_5w5s.yaml`).
 
 Arquivos com prefixo `_` (`_kaggle_active.yaml`) são derivados gerados pelo
 notebook — não edite à mão.
@@ -216,8 +216,8 @@ diretório nenhuma delas é omitida.
 
 | Chave | Default | Efeito |
 | --- | --- | --- |
-| `method` | — (obrigatória) | Cabeça few-shot, registrada em `METHODS` (`src/models/factory.py`). Hoje: `protonet`, `trx`. |
-| `model` | `{}` | Hiperparâmetros do método, repassados como kwargs ao construtor da cabeça. O ProtoNet não tem nenhum; os do TRX estão em "TRX" abaixo. |
+| `method` | — (obrigatória) | Cabeça few-shot, registrada em `METHODS` (`src/models/factory.py`). Hoje: `protonet`, `trx`, `mvp_shot`. |
+| `model` | `{}` | Hiperparâmetros do método, repassados como kwargs ao construtor da cabeça. O ProtoNet não tem nenhum; os do TRX e do MVP-Shot estão nas seções deles, abaixo. |
 | `run_id` | `<method>_<mod>_<k>s_<timestamp>` | Nome dos diretórios de checkpoint e log. Ver acima. |
 | `modalities` | — (obrigatória) | Lista de 1 elemento; a Fase 2 aceita uma modalidade por config. Válidos: `rgb`, `depth`, `mask`, `skeleton_2d`, `skeleton_3d`. |
 | `seed` | — (obrigatória) | Semente de NumPy/Torch/CUDA e do sampler de episódios. |
@@ -228,8 +228,8 @@ diretório nenhuma delas é omitida.
 
 | Chave | Default | Efeito |
 | --- | --- | --- |
-| `name` | `r2plus1d_18` | Backbone (torchvision). **Vídeo**, devolve `(B, D)`: `r2plus1d_18`, `r3d_18`. **Por frame**, devolve `(B, T, D)`: `resnet18`, `resnet34` (D=512), `resnet50` (D=2048, o do TRX). Métodos que comparam frames (TRX) exigem um encoder por frame; o ProtoNet aceita os dois (faz a média no tempo). |
-| `pretrained` | `true` | Pesos Kinetics-400 (vídeo) ou ImageNet `IMAGENET1K_V1` (por frame). Ignorado em `--smoke` (usa peso aleatório). |
+| `name` | `r2plus1d_18` | Backbone (torchvision). **Vídeo**, devolve `(B, D)`: `r2plus1d_18`, `r3d_18`. **Por frame**, devolve `(B, T, D)`: `resnet18`, `resnet34` (D=512), `resnet50` (D=2048, o do TRX) e `clip_rn50` (CLIP ResNet-50 da OpenAI, D=1024, com acesso ao encoder de texto — o do MVP-Shot). Métodos que comparam frames (TRX, MVP-Shot) exigem um encoder por frame; o ProtoNet aceita os dois (faz a média no tempo). |
+| `pretrained` | `true` | Pesos Kinetics-400 (vídeo), ImageNet `IMAGENET1K_V1` (ResNets por frame) ou OpenAI (`clip_rn50`, via open_clip). Ignorado em `--smoke` (usa peso aleatório). |
 | `batch_size` | auto por VRAM | Quantos vídeos passam pelo encoder por forward (encoding em chunks). Knob de OOM **e hiperparâmetro de treino** — ver abaixo. |
 | `gradient_checkpointing` | auto: só liga em GPU ≤6 GB | Recomputa ativações no backward: ~70% menos VRAM de ativação, ~25-30% mais lento por step. **Altera o resultado** (estatísticas do BatchNorm) — faz parte do protocolo, ver abaixo. |
 
@@ -402,15 +402,81 @@ isolar a cabeça, dá para rodar o ProtoNet sobre o mesmo encoder: um config com
 `method: protonet` e o `encoder`/`data` do TRX (o ProtoNet faz a média das
 features por frame — é o baseline do próprio artigo do TRX).
 
+## MVP-Shot
+
+Implementação em `src/models/mvp_shot.py`. O artigo (Qu et al., IEEE TMM 2025,
+arXiv 2405.02077) **não publicou código**; a implementação segue as equações
+dele e, onde ele não especifica, o código do CLIP-FSAR
+(github.com/alibaba-mmai-research/CLIP-FSAR) — o método baseado em CLIP que o
+MVP-Shot estende e com o qual se compara (mesmo encoder, texto e métrica OTAM).
+A OTAM é conferida contra o `OTAM_cum_dist_v2` do CLIP-FSAR em
+`tests/test_mvp_shot.py::test_otam_matches_clipfsar_reference`.
+
+**Texto.** O suporte recebe o embedding do nome da sua classe (encoder de texto
+do CLIP, congelado); a consulta não recebe texto. Os nomes de classe do
+episódio chegam ao modelo pelo trainer (`class_names`), e os embeddings das 12
+classes são calculados uma vez e salvos no checkpoint (`text_embeddings`), então
+a avaliação não precisa do encoder de texto. Os textos estão em `CLASS_TEXTS`
+(`"a tennis flat serve"`, `"a two-handed tennis backhand"`, …) e entram no
+template `"a photo of {}"`. Obs.: o CLIP quase não separa os golpes finos pelo
+texto — o cosseno entre `flat serve` e `kick serve` é 0,96.
+
+### `model` (chaves do MVP-Shot)
+
+| Chave | Default | Efeito |
+| --- | --- | --- |
+| `n_scales` | `3` | Número de velocidades N. Com `frame_count: 8`: 8, 4 e 2 tokens (`frame_count` precisa ser divisível por `2^(N-1)`). |
+| `scale_weights` | `[1, 1, 1]` | α_n da Eq. 11 (pesos das distâncias por velocidade). |
+| `heads` / `mlp_dim` | `8` / `2048` | Camada transformer de cada bloco STI. |
+| `attn_dropout` / `ffn_dropout` | `0.2` / `0.05` | Dropout na saída da atenção e na FFN. |
+| `otam_lambda` | `0.5` | Temperatura do mínimo suave da OTAM. |
+| `prompt_template` | `'a photo of {}'` | Template do texto da classe. |
+| `class_texts` | `CLASS_TEXTS` | Sobrescreve/estende os textos das classes. |
+
+O MVP-Shot exige `encoder.name: clip_rn50`; com outro encoder, o modelo falha
+no início da run.
+
+### Escolhas onde o artigo não especifica
+
+| Ponto | Escolha | Origem |
+| --- | --- | --- |
+| Texto da consulta na correção de canal (Eq. 5) | vetor zero no lugar do texto | nossa (o artigo só diz que a consulta "não usa nomes de classe") |
+| `Downsample` (Eq. 9) | média ponderada aprendível de cada par de tokens vizinhos (começa na média simples) | nossa ("weighted pooling among neighboring tokens") |
+| `TM` (Eq. 8) | média de cada par de tokens | nossa ("pooling operation") |
+| α_n (Eq. 11) | todos 1 | nossa |
+| OTAM | `OTAM_cum_dist_v2`, λ = 0,5, soma das duas direções | CLIP-FSAR |
+| Transformer do STI | 8 cabeças, FFN 2048, dropouts 0,2 / 0,05, texto depois dos frames | CLIP-FSAR |
+| Prompt | `"a photo of {}"` sobre o embedding de texto não normalizado | CLIP-FSAR |
+| Protótipo com K > 1 | média das features do suporte por classe, em cada velocidade | artigo |
+
+### O que difere do artigo
+
+- **Resolução 112² em vez de 224²**, como no TRX. O pooling de atenção do CLIP
+  tem embedding de posição para a grade 7×7 de 224²; a 112² a grade é 3×3, e o
+  embedding é interpolado (bicúbico) a cada forward a partir do parâmetro 7×7,
+  que continua sendo o treinado e salvo. Com o CLIP congelado, 224² não foi
+  melhor que 112² nos episódios de meta-teste do RGB (0,36 contra 0,39, ProtoNet
+  sobre as features) — o ganho vem do fine-tuning, não da resolução.
+- **Adam (lr 1e-4), um episódio por passo, 50 épocas** — o artigo usa Adam com
+  scheduler multi-step e não informa o lr.
+- **15 consultas por classe e 3-way em val/test** — o split 6/3/3 do THETIS.
+- **Sem a perda auxiliar vídeo-texto do CLIP-FSAR** — o MVP-Shot só descreve a
+  entropia cruzada sobre as distâncias.
+
+Como o backbone muda de novo (CLIP contra ResNet-50 ImageNet no TRX), a mesma
+ressalva do TRX vale aqui: a diferença entre métodos mistura cabeça e backbone.
+O config com `method: protonet` e o `encoder`/`data` do MVP-Shot dá o ProtoNet
+sobre as features do CLIP, sem texto.
+
 ## Limitações conhecidas
 
 Registradas aqui porque afetam a leitura dos resultados, mas são comportamento
 atual do código e não configuráveis:
 
 - **Normalização RGB em todas as modalidades.** As estatísticas de
-  normalização são as do Kinetics-400 RGB (encoders de vídeo) ou da ImageNet
-  (encoders por frame) e são aplicadas a qualquer modalidade
-  (`src/models/encoders.py:29-33,69-71`), inclusive `depth`, `mask` e os vídeos de
+  normalização são as do Kinetics-400 RGB (encoders de vídeo), da ImageNet
+  (ResNets por frame) ou do CLIP (`clip_rn50`) e são aplicadas a qualquer
+  modalidade (`src/models/encoders.py`, `*_MEAN`/`*_STD`), inclusive `depth`, `mask` e os vídeos de
   esqueleto, que não são RGB natural. O mesmo vale para `encoder.pretrained`.
 - **Augmentation fixa no código.** Fora o passo temporal
   (`data.temporal_sampling`), `build_train_transform`

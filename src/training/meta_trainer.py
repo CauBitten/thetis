@@ -175,11 +175,13 @@ def assemble_episode_tensors(
     loader: EpisodeLoader,
     episode: dict[str, Any],
     device: torch.device,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, Any]:
     '''Materialise an episode dict into support/query tensors with labels.
 
     The class index used in labels is the local index of the class within the
-    episode's sorted class list (so labels are in ``[0, n_way)``).
+    episode's sorted class list (so labels are in ``[0, n_way)``), and
+    ``classes[i]`` is the canonical label of local class ``i`` — what
+    text-aware heads (MVP-Shot) look up the class-name embedding with.
     '''
     classes: list[str] = list(episode['classes'])
     class_to_idx = {cls: i for i, cls in enumerate(classes)}
@@ -206,6 +208,7 @@ def assemble_episode_tensors(
         'support_labels': torch.tensor(support_labels, dtype=torch.long, device=device),
         'query_labels': torch.tensor(query_labels, dtype=torch.long, device=device),
         'n_way': torch.tensor(len(classes), dtype=torch.long),
+        'classes': classes,
     }
 
 
@@ -322,6 +325,7 @@ def _run_eval(
                 tensors['support_labels'],
                 tensors['query_labels'],
                 n_way=n_way,
+                class_names=tensors['classes'],
             )
             accs.append(out['accuracy'])
             losses.append(float(out['loss'].detach()))
@@ -350,7 +354,7 @@ def _log_cuda_mem(tag: str, device: torch.device) -> None:
 
 def _train_step_streaming(
     model: EpisodicModel,
-    tensors: dict[str, torch.Tensor],
+    tensors: dict[str, Any],
     n_way: int,
     optimizer: optim.Optimizer,
     scaler: Any,
@@ -388,7 +392,7 @@ def _train_step_streaming(
 
     with amp_ctx:
         support_emb = model.encoder(support)
-        state = model.support_state(support_emb, support_labels, n_way)
+        state = model.support_state(support_emb, support_labels, n_way, tensors.get('classes'))
     if profile:
         _log_cuda_mem('after-support', device)
 
@@ -709,6 +713,7 @@ def run_training(
                             tensors['support_labels'],
                             tensors['query_labels'],
                             n_way=n_way_train,
+                            class_names=tensors['classes'],
                         )
                     scaler.scale(out['loss']).backward()
                     scaler.step(optimizer)
@@ -720,6 +725,7 @@ def run_training(
                         tensors['support_labels'],
                         tensors['query_labels'],
                         n_way=n_way_train,
+                        class_names=tensors['classes'],
                     )
                     out['loss'].backward()
                     optimizer.step()

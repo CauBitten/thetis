@@ -148,9 +148,16 @@ class TRX(EpisodicModel):
             raise ValueError(f'TRX needs per-frame (B, T, D) features; got shape {tuple(emb.shape)}')
 
     def support_state(
-        self, support_emb: torch.Tensor, support_labels: torch.Tensor, n_way: int
+        self,
+        support_emb: torch.Tensor,
+        support_labels: torch.Tensor,
+        n_way: int,
+        class_names: Sequence[str] | None = None,
     ) -> list[list[tuple[torch.Tensor, torch.Tensor]]]:
-        '''Per branch, per class: the ``(K, P, d_model)`` keys and values of that class's support videos.'''
+        '''Per branch, per class: the ``(K, P, d_model)`` keys and values of that class's support videos.
+
+        ``class_names`` is unused (TRX is vision-only).
+        '''
         self._check_frames(support_emb)
         masks = []
         for c in range(n_way):
