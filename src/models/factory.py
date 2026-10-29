@@ -3,7 +3,8 @@
 ``encoder.name`` picks the encoder family (:data:`VIDEO_BACKBONES` → clip-level
 :class:`VideoEncoder`, :data:`FRAME_BACKBONES` → per-frame
 :class:`FrameEncoder`, :data:`CLIP_BACKBONES` → per-frame
-:class:`ClipFrameEncoder`), ``method`` picks the head from :data:`METHODS`, and
+:class:`ClipFrameEncoder`, :data:`VIDEOMAE_BACKBONES` → clip-level
+:class:`VideoMAEEncoder`), ``method`` picks the head from :data:`METHODS`, and
 the optional ``model`` mapping of the config is forwarded to the head's
 constructor as keyword arguments (method-specific hyperparameters).
 '''
@@ -18,18 +19,22 @@ from src.models.encoders import (
     CLIP_BACKBONES,
     FRAME_BACKBONES,
     VIDEO_BACKBONES,
+    VIDEOMAE_BACKBONES,
     ClipFrameEncoder,
     FrameEncoder,
     VideoEncoder,
+    VideoMAEEncoder,
 )
 from src.models.mvp_shot import MVPShot
 from src.models.protonet import ProtoNet
+from src.models.safsar import SAFSAR
 from src.models.trx import TRX
 
 METHODS: dict[str, type[EpisodicModel]] = {
     'protonet': ProtoNet,
     'trx': TRX,
     'mvp_shot': MVPShot,
+    'safsar': SAFSAR,
 }
 
 
@@ -41,8 +46,10 @@ def build_encoder(encoder_cfg: dict[str, Any], pretrained: bool, use_checkpointi
         return FrameEncoder(name=name, pretrained=pretrained, use_checkpointing=use_checkpointing)
     if name in CLIP_BACKBONES:
         return ClipFrameEncoder(name=name, pretrained=pretrained, use_checkpointing=use_checkpointing)
+    if name in VIDEOMAE_BACKBONES:
+        return VideoMAEEncoder(name=name, pretrained=pretrained, use_checkpointing=use_checkpointing)
     raise ValueError(
-        f'unknown encoder.name {name!r}; video: {list(VIDEO_BACKBONES)}, '
+        f'unknown encoder.name {name!r}; video: {list(VIDEO_BACKBONES) + list(VIDEOMAE_BACKBONES)}, '
         f'per-frame: {list(FRAME_BACKBONES) + list(CLIP_BACKBONES)}'
     )
 

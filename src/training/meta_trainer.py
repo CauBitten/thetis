@@ -390,9 +390,11 @@ def _train_step_streaming(
         else _nullcontext()
     )
 
+    class_names = tensors.get('classes')
     with amp_ctx:
         support_emb = model.encoder(support)
-        state = model.support_state(support_emb, support_labels, n_way, tensors.get('classes'))
+        state = model.support_state(support_emb, support_labels, n_way, class_names)
+        support_aux = model.auxiliary_loss(support_emb, support_labels, class_names)
     if profile:
         _log_cuda_mem('after-support', device)
 
@@ -409,6 +411,11 @@ def _train_step_streaming(
             logits = model.query_logits(query_emb, state)
             # reduction='sum' / n_query reproduces the full-episode mean CE exactly.
             loss_mb = F.cross_entropy(logits, labels_mb, reduction='sum') / n_query
+            query_aux = model.auxiliary_loss(query_emb, labels_mb, class_names)
+            if query_aux is not None:  # a mean over the slice → weight it by the slice's share
+                loss_mb = loss_mb + query_aux * (end - start) / n_query
+            if start == 0 and support_aux is not None:
+                loss_mb = loss_mb + support_aux
         if scaler is not None:
             scaler.scale(loss_mb).backward(retain_graph=retain)
         else:
@@ -577,6 +584,13 @@ def run_training(
     encoder_batch_default = _default_encoder_batch_size(device, smoke=smoke)
     encoder_batch_size = int(encoder_cfg.get('batch_size', encoder_batch_default))
     model = build_model(cfg, encoder, encoder_batch_size=encoder_batch_size).to(device)
+    # Heads with a global classifier (SAFSAR) name their training classes in the
+    # config; a mismatch with the split would silently skip that loss.
+    model_train_classes = getattr(model, 'train_classes', None)
+    if model_train_classes is not None and sorted(model_train_classes) != sorted(splits['meta_train']):
+        raise ValueError(
+            f'model.train_classes {sorted(model_train_classes)} != meta_train split {sorted(splits["meta_train"])}'
+        )
 
     # Mixed precision: fp16 autocast on CUDA cuts activations roughly in half
     # and is the easiest knob to keep R(2+1)D-18 fitting in 4 GB GPUs.

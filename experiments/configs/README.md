@@ -9,7 +9,7 @@ do K, e não do hardware onde rodou.
 Entre dois configs do mesmo método, só três coisas mudam: `run_id`,
 `modalities` e `episode.k_shot`. Entre métodos, muda só o que é do método
 (`method`, `encoder.name`, `model` e a amostragem temporal); splits, episódios,
-seed, otimizador e avaliação são os mesmos — ver "TRX" e "MVP-Shot" abaixo.
+seed, otimizador e avaliação são os mesmos — ver "TRX", "MVP-Shot" e "SAFSAR" abaixo.
 
 ## Convenção de nomes
 
@@ -38,8 +38,8 @@ do Kaggle sobrescreve `cfg["run_id"]` depois de carregar, então não é afetado
 | `skeleton_2d` | `protonet_skeleton2d_5w1s.yaml` | `protonet_skeleton2d_5w5s.yaml` |
 | `skeleton_3d` | `protonet_skeleton3d_5w1s.yaml` | `protonet_skeleton3d_5w5s.yaml` |
 
-Os 10 do TRX e os 10 do MVP-Shot seguem o mesmo padrão, com prefixos `trx_` e
-`mvp_shot_` (`trx_rgb_5w1s.yaml`, …, `mvp_shot_skeleton3d_5w5s.yaml`).
+Os 10 do TRX, do MVP-Shot e do SAFSAR seguem o mesmo padrão, com prefixos
+`trx_`, `mvp_shot_` e `safsar_` (`trx_rgb_5w1s.yaml`, …, `safsar_skeleton3d_5w5s.yaml`).
 
 Arquivos com prefixo `_` (`_kaggle_active.yaml`) são derivados gerados pelo
 notebook — não edite à mão.
@@ -216,8 +216,8 @@ diretório nenhuma delas é omitida.
 
 | Chave | Default | Efeito |
 | --- | --- | --- |
-| `method` | — (obrigatória) | Cabeça few-shot, registrada em `METHODS` (`src/models/factory.py`). Hoje: `protonet`, `trx`, `mvp_shot`. |
-| `model` | `{}` | Hiperparâmetros do método, repassados como kwargs ao construtor da cabeça. O ProtoNet não tem nenhum; os do TRX e do MVP-Shot estão nas seções deles, abaixo. |
+| `method` | — (obrigatória) | Cabeça few-shot, registrada em `METHODS` (`src/models/factory.py`). Hoje: `protonet`, `trx`, `mvp_shot`, `safsar`. |
+| `model` | `{}` | Hiperparâmetros do método, repassados como kwargs ao construtor da cabeça. O ProtoNet não tem nenhum; os do TRX, do MVP-Shot e do SAFSAR estão nas seções deles, abaixo. |
 | `run_id` | `<method>_<mod>_<k>s_<timestamp>` | Nome dos diretórios de checkpoint e log. Ver acima. |
 | `modalities` | — (obrigatória) | Lista de 1 elemento; a Fase 2 aceita uma modalidade por config. Válidos: `rgb`, `depth`, `mask`, `skeleton_2d`, `skeleton_3d`. |
 | `seed` | — (obrigatória) | Semente de NumPy/Torch/CUDA e do sampler de episódios. |
@@ -228,8 +228,8 @@ diretório nenhuma delas é omitida.
 
 | Chave | Default | Efeito |
 | --- | --- | --- |
-| `name` | `r2plus1d_18` | Backbone (torchvision). **Vídeo**, devolve `(B, D)`: `r2plus1d_18`, `r3d_18`. **Por frame**, devolve `(B, T, D)`: `resnet18`, `resnet34` (D=512), `resnet50` (D=2048, o do TRX) e `clip_rn50` (CLIP ResNet-50 da OpenAI, D=1024, com acesso ao encoder de texto — o do MVP-Shot). Métodos que comparam frames (TRX, MVP-Shot) exigem um encoder por frame; o ProtoNet aceita os dois (faz a média no tempo). |
-| `pretrained` | `true` | Pesos Kinetics-400 (vídeo), ImageNet `IMAGENET1K_V1` (ResNets por frame) ou OpenAI (`clip_rn50`, via open_clip). Ignorado em `--smoke` (usa peso aleatório). |
+| `name` | `r2plus1d_18` | Backbone. **Vídeo**, devolve `(B, D)`: `r2plus1d_18`, `r3d_18` (torchvision) e `videomae_base` (VideoMAE-Base K400 via Hugging Face, D=768, com acesso ao BERT-Base — o do SAFSAR). **Por frame**, devolve `(B, T, D)`: `resnet18`, `resnet34` (D=512), `resnet50` (D=2048, o do TRX) e `clip_rn50` (CLIP ResNet-50 da OpenAI, D=1024, com acesso ao encoder de texto — o do MVP-Shot). Métodos que comparam frames (TRX, MVP-Shot) exigem um encoder por frame; o ProtoNet aceita os dois (faz a média no tempo). |
+| `pretrained` | `true` | Pesos Kinetics-400 (vídeo), ImageNet `IMAGENET1K_V1` (ResNets por frame), OpenAI (`clip_rn50`, via open_clip) ou `MCG-NJU/videomae-base-finetuned-kinetics` + `bert-base-uncased` (`videomae_base`). Ignorado em `--smoke` (usa peso aleatório). |
 | `batch_size` | auto por VRAM | Quantos vídeos passam pelo encoder por forward (encoding em chunks). Knob de OOM **e hiperparâmetro de treino** — ver abaixo. |
 | `gradient_checkpointing` | auto: só liga em GPU ≤6 GB | Recomputa ativações no backward: ~70% menos VRAM de ativação, ~25-30% mais lento por step. **Altera o resultado** (estatísticas do BatchNorm) — faz parte do protocolo, ver abaixo. |
 
@@ -440,7 +440,9 @@ no início da run.
 
 | Ponto | Escolha | Origem |
 | --- | --- | --- |
-| Texto da consulta na correção de canal (Eq. 5) | vetor zero no lugar do texto | nossa (o artigo só diz que a consulta "não usa nomes de classe") |
+| Correção de canal na consulta (Eq. 5–7) | a consulta não passa pela correção de canal (sem nome de classe, não há o que corrigir) | nossa (o artigo só diz que a consulta "não usa nomes de classe") — ver "Correção de estabilidade" |
+| Normalização entre velocidades | LayerNorm na entrada de cada bloco STI | nossa — ver "Correção de estabilidade" |
+| Limite da correção de canal (Eq. 7) | `tanh` na saída do MLP: no máximo ±1 por canal | nossa — ver "Correção de estabilidade" |
 | `Downsample` (Eq. 9) | média ponderada aprendível de cada par de tokens vizinhos (começa na média simples) | nossa ("weighted pooling among neighboring tokens") |
 | `TM` (Eq. 8) | média de cada par de tokens | nossa ("pooling operation") |
 | α_n (Eq. 11) | todos 1 | nossa |
@@ -448,6 +450,45 @@ no início da run.
 | Transformer do STI | 8 cabeças, FFN 2048, dropouts 0,2 / 0,05, texto depois dos frames | CLIP-FSAR |
 | Prompt | `"a photo of {}"` sobre o embedding de texto não normalizado | CLIP-FSAR |
 | Protótipo com K > 1 | média das features do suporte por classe, em cada velocidade | artigo |
+
+### Correção de estabilidade (as runs anteriores do MVP-Shot são inválidas)
+
+A primeira versão punha um vetor zero no lugar do texto da consulta na correção
+de canal e não normalizava a entrada das velocidades. Nas 10 runs do Kaggle
+isso falhou de dois jeitos:
+
+- **Colapso:** a correção de canal da consulta, `MLP([contexto; 0])`, virou um
+  classificador das 6 classes de treino e passou a dominar os tokens. Na 3ª
+  velocidade, vídeos diferentes ficavam com cosseno 1,000 entre si, mesmo na
+  run de RGB, que chegou a 100% no treino e só 0,66 no meta-teste 1-shot.
+- **Estouro do fp16:** as ativações cresciam de uma velocidade para a outra (em
+  skeleton3d, a saída da 3ª passou de 65.504). As duas runs dessa modalidade
+  viraram NaN: o 1-shot nunca aprendeu, e o 5-shot perdeu os pesos depois da
+  época 25.
+
+A correção tem três partes: (1) a consulta pula a correção de canal; (2) cada
+velocidade normaliza a própria entrada; (3) a correção de canal passa por
+`tanh`, ficando em no máximo ±1 por canal.
+
+Ela foi escolhida num experimento só com a cabeça, sobre features do CLIP
+congelado do RGB, com avaliação em episódios 3-way de `meta_val`:
+
+| Variante | val 1-shot | val 5-shot | maior ativação, lr 10× por 3000 episódios |
+| --- | --- | --- | --- |
+| primeira versão | 0,713 | 0,768 | 3×10¹² (colapsa e estoura) |
+| (1) + (2) | 0,736 | 0,777 | ~55 mil (perto do limite do fp16, 65.504) |
+| (1) + (2) + LayerNorm na saída | 0,722 | 0,782 | `p` passa de 275 mil antes da normalização |
+| **(1) + (2) + (3)** | 0,717 | 0,779 | **2.302** |
+| sem texto (referência) | 0,634 | — | — |
+
+As acurácias empatam dentro do ruído (cerca de ±0,02); a escolha é pela
+estabilidade. O texto continua contribuindo (cerca de +0,08 sobre a variante sem
+texto), e as 3 velocidades seguem informativas: no 5-shot, cada uma sozinha
+acerta 0,75–0,77. O teste
+`test_psti_is_scale_invariant_and_queries_skip_channel_correction` impede a
+regressão. Os checkpoints antigos do MVP-Shot não carregam mais (há um
+LayerNorm novo por bloco) e devem ser descartados: **as 10 runs precisam ser
+refeitas**.
 
 ### O que difere do artigo
 
@@ -467,6 +508,65 @@ Como o backbone muda de novo (CLIP contra ResNet-50 ImageNet no TRX), a mesma
 ressalva do TRX vale aqui: a diferença entre métodos mistura cabeça e backbone.
 O config com `method: protonet` e o `encoder`/`data` do MVP-Shot dá o ProtoNet
 sobre as features do CLIP, sem texto.
+
+## SAFSAR
+
+Implementação em `src/models/safsar.py`. O artigo (Tang, Béjar e Vidal, WACV
+2024, arXiv 2311.06218) **não publicou código**; a implementação segue as
+equações dele (§3):
+
+1. VideoMAE-Base extrai um vetor por vídeo (3D); o protótipo de cada classe é a
+   média do suporte (Eq. 1–2).
+2. **MM Fusion** (Eq. 3): o protótipo entra como um token a mais junto dos
+   tokens BERT (congelado) da **descrição** da classe, e um transformer de 2
+   camadas os funde; a saída na posição do protótipo é o protótipo
+   "semântico". A consulta não passa por aqui.
+3. **TLM** (Eq. 4): uma camada transformer sobre os N protótipos + a consulta.
+4. Logits = cosseno entre a consulta e cada protótipo, sem temperatura (Eq. 5–6).
+5. Perda = entropia cruzada + λ × classificador linear global sobre as 6 classes
+   de `meta_train`, aplicado às features do VideoMAE de suporte e consulta
+   (Eq. 7–9). Em val e test, cujas classes são novas, esse termo não existe.
+
+O VideoMAE **não tem BatchNorm** (só LayerNorm): para o SAFSAR, `batch_size`,
+`stream_query` e `gradient_checkpointing` só mudam a memória, não o resultado.
+Os configs mantêm os mesmos valores dos outros métodos.
+
+### `model` (chaves do SAFSAR)
+
+| Chave | Default | Efeito |
+| --- | --- | --- |
+| `fusion_layers` | `2` | ℓ, camadas do transformer de fusão (o melhor valor no artigo). |
+| `heads` / `mlp_dim` / `dropout` | `12` / `3072` / `0.1` | Todas as camadas transformer (fusão e TLM). |
+| `train_classes` | — | As classes de `meta_train`, linhas do classificador global. O trainer confere com o split e para no início se não bater; sem a chave, a perda global fica desligada. |
+| `global_loss_weight` | `1.0` | λ da Eq. 9. |
+| `class_descriptions` | `CLASS_DESCRIPTIONS` | Sobrescreve/estende as descrições dos golpes. |
+
+O SAFSAR exige `encoder.name: videomae_base`. As descrições são codificadas uma
+vez, e os tokens ficam salvos no checkpoint (`text_tokens`), então a avaliação
+não precisa do BERT.
+
+### Escolhas onde o artigo não especifica
+
+| Ponto | Escolha |
+| --- | --- |
+| Pesos do VideoMAE | `MCG-NJU/videomae-base-finetuned-kinetics` (K400; o artigo usa K400 no SSv2 e K710 nos outros) |
+| BERT | `bert-base-uncased` (o artigo usa os pesos do VALOR) |
+| Descrições das classes | escritas para o THETIS (`CLASS_DESCRIPTIONS`), como o artigo fez com o ChatGPT para o EPIC-KITCHENS |
+| Camadas transformer | d = 768, 12 cabeças, FFN 3072, dropout 0,1, post-norm (padrão ViT/BERT-Base) |
+| TLM com várias consultas | os episódios do artigo têm 1 consulta; aqui cada consulta passa pelo TLM com os N protótipos de forma independente |
+| λ | 1,0 |
+
+### O que difere do artigo
+
+- **Resolução 112² em vez de 224²**, como nos outros métodos. A tabela de
+  posição do VideoMAE é um seno fixo para a grade de pré-treino (8×14×14
+  tubelets); a 8×112² a grade é 4×7×7, e a tabela é reamostrada (trilinear).
+  Com os pesos congelados, o VideoMAE já fica acima do acaso nos episódios de
+  meta-teste do RGB (0,46 com ProtoNet sobre as features, contra 0,39 do CLIP e
+  0,33 do acaso).
+- **Adam (lr 1e-4), um episódio por passo, 50 épocas** — o artigo usa Adam e
+  não informa o lr.
+- **15 consultas por classe e 3-way em val/test** — o split 6/3/3 do THETIS.
 
 ## Limitações conhecidas
 

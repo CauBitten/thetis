@@ -9,7 +9,10 @@ OR re-samples episodes with the saved config, then reports
 - per-class confusion matrix.
 
 Outputs land under ``outputs/results/<run_id>/`` as ``metrics.json`` plus a
-confusion-matrix PNG.
+confusion-matrix PNG. ``--speed-split beginner_to_expert`` (support from
+p1–p31, query from p32–p55) or ``expert_to_beginner`` evaluates the speed
+robustness subgroup instead; its files get a ``_<mode>`` suffix, so they sit
+next to the standard ones.
 '''
 from __future__ import annotations
 
@@ -60,6 +63,7 @@ def _iter_episodes_from_jsonl(path: Path):
 def _iter_episodes_from_sampler(
     cfg: dict[str, Any],
     n_episodes: int,
+    speed_split: str = 'none',
 ) -> tuple[list[dict[str, Any]], int]:
     '''Re-sample meta_test episodes using the saved config.
 
@@ -93,7 +97,7 @@ def _iter_episodes_from_sampler(
         q_query=int(ep_cfg['q_query']),
         splits=splits,
         seed=seed + 2,
-        speed_split='none',
+        speed_split=speed_split,
         modality=modality,
         # same filter as training, so meta_test is not scored on blank clips or
         # on footage duplicated into both support and query
@@ -112,6 +116,7 @@ def run_eval(
     output_root: str | Path,
     n_episodes: int | None,
     device_arg: str | None,
+    speed_split: str = 'none',
 ) -> dict[str, Any]:
     '''Evaluate a checkpoint against ``meta_test`` episodes.'''
     ckpt_path = Path(checkpoint_path).resolve()
@@ -161,7 +166,9 @@ def run_eval(
         n_way = episodes[0]['n_way'] if episodes else int(cfg['episode'].get('n_way_test', cfg['episode']['n_way']))
     else:
         episodes, n_way = _iter_episodes_from_sampler(
-            cfg, n_episodes if n_episodes is not None else int(cfg['episode'].get('episodes_meta_test', 1000))
+            cfg,
+            n_episodes if n_episodes is not None else int(cfg['episode'].get('episodes_meta_test', 1000)),
+            speed_split,
         )
 
     accs: list[float] = []
@@ -201,15 +208,17 @@ def run_eval(
     run_id = cfg.get('run_id') or ckpt_path.parent.name
     results_dir = Path(output_root) / 'results' / run_id
     results_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = results_dir / 'metrics.json'
-    confusion_csv = results_dir / 'confusion.csv'
-    confusion_png = results_dir / 'confusion.png'
+    suffix = '' if speed_split == 'none' else f'_{speed_split}'
+    metrics_path = results_dir / f'metrics{suffix}.json'
+    confusion_csv = results_dir / f'confusion{suffix}.csv'
+    confusion_png = results_dir / f'confusion{suffix}.png'
 
     payload = {
         'run_id': run_id,
         'checkpoint': str(ckpt_path),
         'evaluated_at': _dt.datetime.now(_dt.timezone.utc).isoformat(timespec='seconds'),
         'n_episodes': len(accs),
+        'speed_split': speed_split,
         'n_way': int(n_way),
         'k_shot': int(cfg['episode']['k_shot']),
         'q_query': int(cfg['episode']['q_query']),
@@ -226,7 +235,7 @@ def run_eval(
         except Exception as exc:  # noqa: BLE001 — plotting failure shouldn't kill the eval
             print(f'warning: failed to render confusion PNG: {exc}')
 
-    print(f'meta_test  acc = {mean:.4f}  ±  {ci:.4f}  (95% CI, n={len(accs)} episodes)')
+    print(f'meta_test{suffix}  acc = {mean:.4f}  ±  {ci:.4f}  (95% CI, n={len(accs)} episodes)')
     print(f'metrics → {metrics_path}')
     return payload
 
@@ -244,6 +253,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--output-root', type=Path, default=Path('outputs'))
     parser.add_argument('--n-episodes', type=int, default=None)
     parser.add_argument('--device', type=str, default=None)
+    parser.add_argument(
+        '--speed-split',
+        choices=['none', 'beginner_to_expert', 'expert_to_beginner'],
+        default='none',
+        help='Speed-robustness subgroup: support from one skill level, query from the other.',
+    )
     return parser
 
 
@@ -256,6 +271,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_root=args.output_root,
         n_episodes=args.n_episodes,
         device_arg=args.device,
+        speed_split=args.speed_split,
     )
     return 0
 

@@ -13,8 +13,8 @@ Pipeline for an episode (per-frame CLIP features ``(B, T, C)``, T = 8):
    - the *Temporal Relation Network* (Eq. 1-3): the class-name text token is
      concatenated to the frame tokens and one pre-norm transformer layer
      (multi-head self-attention + FFN) runs over the ``T+1`` tokens;
-   - the *Channel Correction Network* (Eq. 4-7): ``MLP([mean frame token;
-     enhanced text token])`` gives a vector that is added to every frame token.
+   - the *Channel Correction Network* (Eq. 4-7): ``tanh(MLP([mean frame token;
+     enhanced text token]))`` gives a vector that is added to every frame token.
 
    The next velocity's input is ``Linear(TM(X_out) + Downsample(X_in))``
    (Eq. 8-9), with half the tokens, and the enhanced text token is carried to
@@ -27,7 +27,14 @@ Choices where the paper gives no detail (also listed in
 ``experiments/configs/README.md``):
 
 - query videos carry no text: no text token in the temporal transformer, and
-  a zero vector in place of the text in the channel-correction MLP;
+  no channel correction either. A zero vector in place of the text (the first
+  version) let the query's correction become a classifier of the 6 training
+  classes that swamped the visual tokens (cosine 1.0 between different videos
+  at the 3rd velocity) and overflowed fp16;
+- each velocity's input is layer-normalised before its STI block, which stops
+  the residual stream from growing from one velocity to the next, and the
+  channel correction goes through ``tanh`` (at most ±1 per channel), so the
+  class text can steer the support tokens but not swamp them or overflow fp16;
 - ``Downsample`` is a learnable softmax-weighted pooling of each pair of
   neighbouring tokens (it starts as the mean); ``TM`` is the mean of each pair;
 - ``α_n = 1`` for every velocity (``scale_weights``);
@@ -118,6 +125,7 @@ class STIBlock(nn.Module):
 
     def __init__(self, dim: int, heads: int, mlp_dim: int, attn_dropout: float, ffn_dropout: float) -> None:
         super().__init__()
+        self.norm_in = nn.LayerNorm(dim)
         self.norm_attn = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
         self.attn_drop = nn.Dropout(attn_dropout)
@@ -129,16 +137,18 @@ class STIBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, text: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         '''Frame tokens ``(B, T, C)`` and text token ``(B, C)`` (``None`` for queries) → ``X_out``, enhanced text.'''
+        x = self.norm_in(x)  # bounds each velocity's input (no compounding growth across velocities)
         n_frames = x.shape[1]
         tokens = x if text is None else torch.cat([x, text.to(x.dtype).unsqueeze(1)], dim=1)
         h = self.norm_attn(tokens)
         tokens = tokens + self.attn_drop(self.attn(h, h, h, need_weights=False)[0])  # Eq. 1-2
         tokens = tokens + self.ffn(self.norm_ffn(tokens))                            # Eq. 3
         frames = tokens[:, :n_frames]
-        text_out = None if text is None else tokens[:, n_frames]
+        if text is None:
+            return frames, None  # queries: no class name, so no semantic channel correction
+        text_out = tokens[:, n_frames]
         context = frames.mean(dim=1)                                                 # Eq. 4
-        text_in = torch.zeros_like(context) if text_out is None else text_out
-        modulation = self.channel_mlp(torch.cat([context, text_in], dim=-1))         # Eq. 5-6
+        modulation = torch.tanh(self.channel_mlp(torch.cat([context, text_out], dim=-1)))  # Eq. 5-6, bounded
         return frames + modulation.unsqueeze(1), text_out                            # Eq. 7
 
 

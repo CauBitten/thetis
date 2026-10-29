@@ -259,3 +259,15 @@ def test_trx_train_then_eval_end_to_end(tmp_path: Path, monkeypatch: pytest.Monk
     payload = run_eval(ckpt, None, tmp_path / 'outputs', n_episodes=3, device_arg='cpu')
     assert payload['n_episodes'] == 3
     assert 0.0 <= payload['mean_accuracy'] <= 1.0
+
+    # speed-robustness subgroup: support only from beginners (p1-p31), query only from experts (p32-p55)
+    from src.training.eval_episodic import _iter_episodes_from_sampler  # noqa: PLC0415
+
+    episodes, _ = _iter_episodes_from_sampler(blob['config'], 5, 'beginner_to_expert')
+    actor = lambda sid: int(sid.split('_')[0][1:])  # noqa: E731
+    for ep in episodes:
+        assert all(actor(s) <= 31 for ids in ep['support'].values() for s in ids)
+        assert all(actor(s) >= 32 for ids in ep['query'].values() for s in ids)
+    speed = run_eval(ckpt, None, tmp_path / 'outputs', n_episodes=3, device_arg='cpu', speed_split='beginner_to_expert')
+    assert speed['speed_split'] == 'beginner_to_expert'
+    assert (tmp_path / 'outputs' / 'results' / 'unittest_trx' / 'metrics_beginner_to_expert.json').exists()

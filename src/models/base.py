@@ -13,7 +13,9 @@ A head scores an episode in two steps, so the trainer can stream the query set:
    ``meta_trainer._train_step_streaming`` exact.
 
 ``forward`` composes the two over the whole episode and adds the
-cross-entropy; subclasses implement only the two steps. The encoder is
+cross-entropy; subclasses implement only the two steps, plus
+:meth:`EpisodicModel.auxiliary_loss` when the method has an extra loss term
+(SAFSAR's global classifier). The encoder is
 decoupled: clip-level encoders return ``(B, D)``, per-frame encoders
 ``(B, T, D)`` (see :mod:`src.models.encoders`), and each head declares
 which one it needs via :attr:`EpisodicModel.needs_frame_features`.
@@ -92,6 +94,12 @@ class EpisodicModel(nn.Module):
         '''``(n_query, n_way)`` logits for a slice of the query set, given ``support_state``.'''
         raise NotImplementedError
 
+    def auxiliary_loss(
+        self, emb: torch.Tensor, labels: torch.Tensor, class_names: Sequence[str] | None
+    ) -> torch.Tensor | None:
+        '''Extra loss, averaged over the given videos (support or a query slice); ``None`` = no extra term.'''
+        return None
+
     def forward(
         self,
         support: torch.Tensor,
@@ -119,6 +127,10 @@ class EpisodicModel(nn.Module):
         state = self.support_state(embeddings[:n_support], support_labels, n_way, class_names)
         logits = self.query_logits(embeddings[n_support:], state)
         loss = F.cross_entropy(logits, query_labels)
+        for emb, labels in ((embeddings[:n_support], support_labels), (embeddings[n_support:], query_labels)):
+            aux = self.auxiliary_loss(emb, labels, class_names)
+            if aux is not None:
+                loss = loss + aux
         preds = logits.argmax(dim=-1)
         accuracy = float((preds == query_labels).float().mean().item())
 

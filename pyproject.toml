@@ -15,6 +15,7 @@ dependencies = [
     "pyyaml>=6.0",
     "scipy>=1.11",
     "open-clip-torch>=2.24",
+    "transformers>=4.45",
 ]
 
 [project.optional-dependencies]

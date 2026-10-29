@@ -14,6 +14,9 @@ normalisation internally via :func:`preprocess_video_batch`:
 - :class:`ClipFrameEncoder` (per-frame, ``(B, T, embed_dim)``): the visual
   tower of OpenAI CLIP (ResNet-50), applied to every frame, plus access to the
   frozen CLIP text tower for heads that use class-name text (MVP-Shot).
+- :class:`VideoMAEEncoder` (clip-level, ``(B, embed_dim)``): VideoMAE-Base
+  (ViT over 3D tubelets, Kinetics-400), plus frozen BERT-Base token features
+  for heads that fuse class descriptions (SAFSAR).
 
 Gradient checkpointing (``use_checkpointing=True``) trades ~30% extra
 compute for ~70% less activation memory by re-running each ResNet stage
@@ -47,6 +50,10 @@ VIDEO_BACKBONES: tuple[str, ...] = ('r2plus1d_18', 'r3d_18')
 FRAME_BACKBONES: tuple[str, ...] = ('resnet18', 'resnet34', 'resnet50')
 #: config name → open_clip architecture (the OpenAI weights were trained with QuickGELU).
 CLIP_BACKBONES: dict[str, str] = {'clip_rn50': 'RN50-quickgelu'}
+#: config name → Hugging Face checkpoint (Kinetics-400, supervised fine-tuning).
+VIDEOMAE_BACKBONES: dict[str, str] = {'videomae_base': 'MCG-NJU/videomae-base-finetuned-kinetics'}
+#: text tower paired with VideoMAE (SAFSAR).
+BERT_CHECKPOINT = 'bert-base-uncased'
 
 
 def preprocess_video_batch(
@@ -248,6 +255,88 @@ class ClipFrameEncoder(nn.Module):
         return model.encode_text(tokens).float()
 
 
+class VideoMAEEncoder(nn.Module):
+    '''VideoMAE-Base as a clip-level encoder: ``(B, T, H, W, 3)`` → ``(B, embed_dim)``.
+
+    Same output as Hugging Face's ``VideoMAEForVideoClassification`` without
+    its classifier: mean of the last-layer tokens + ``fc_norm``. The patch
+    embedding is frozen (as in SAFSAR). Hugging Face only accepts the
+    configured 16×224² input, so the forward runs its submodules with the fixed
+    sin-cos position table resampled (trilinear) from the pretraining grid of
+    8×14×14 tubelets to the input's grid — 4×7×7 at 8×112². There is no
+    BatchNorm, so chunk size and gradient checkpointing do not change results.
+
+    :meth:`encode_text_tokens` gives the frozen BERT-Base token features SAFSAR
+    fuses with the video; like :meth:`ClipFrameEncoder.encode_text`, BERT is
+    rebuilt on each call and never becomes a submodule.
+    '''
+
+    per_frame = False
+
+    def __init__(self, name: str = 'videomae_base', pretrained: bool = True, use_checkpointing: bool = False) -> None:
+        super().__init__()
+        from transformers import VideoMAEConfig, VideoMAEForVideoClassification  # noqa: PLC0415
+
+        if name not in VIDEOMAE_BACKBONES:
+            raise ValueError(f'unknown VideoMAE backbone: {name!r}; valid: {list(VIDEOMAE_BACKBONES)}')
+        self.name = name
+        self.pretrained = bool(pretrained)
+        model = None
+        if self.pretrained:
+            try:
+                model = VideoMAEForVideoClassification.from_pretrained(VIDEOMAE_BACKBONES[name])
+            except Exception as exc:  # noqa: BLE001 — pretrained download can fail in many ways
+                warnings.warn(f'failed to load pretrained {name}: {exc}; falling back to random init', stacklevel=2)
+        if model is None:
+            model = VideoMAEForVideoClassification(VideoMAEConfig())  # the videomae-base architecture
+        model.classifier = nn.Identity()
+        model.videomae.embeddings.patch_embeddings.requires_grad_(False)
+        if use_checkpointing:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+        self.backbone = model
+        cfg = model.config
+        self.embed_dim: int = int(cfg.hidden_size)
+        self._tubelet, self._patch = int(cfg.tubelet_size), int(cfg.patch_size)
+        self._pretrain_grid = (cfg.num_frames // self._tubelet, cfg.image_size // self._patch, cfg.image_size // self._patch)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        '''``(B, T, H, W, 3)`` uint8/float in → ``(B, embed_dim)`` out.'''
+        y = preprocess_video_batch(x, mean=IMAGENET_MEAN, std=IMAGENET_STD)  # (B, 3, T, H, W)
+        net = self.backbone.videomae
+        tokens = net.embeddings.patch_embeddings.projection(y).flatten(2).transpose(1, 2)  # (B, t*h*w, C)
+        grid = (y.shape[2] // self._tubelet, y.shape[3] // self._patch, y.shape[4] // self._patch)
+        tokens = tokens + self._position_table(grid).to(device=tokens.device, dtype=tokens.dtype)
+        hidden = net.encoder(tokens).last_hidden_state
+        return self.backbone.fc_norm(hidden.mean(dim=1))
+
+    def _position_table(self, grid: tuple[int, int, int]) -> torch.Tensor:
+        table = self.backbone.videomae.embeddings.position_embeddings  # fixed (1, 8*14*14, C), not a parameter
+        if grid == self._pretrain_grid:
+            return table
+        c = table.shape[-1]
+        table = table.reshape(1, *self._pretrain_grid, c).permute(0, 4, 1, 2, 3)
+        table = F.interpolate(table, size=grid, mode='trilinear', align_corners=False)
+        return table.flatten(2).transpose(1, 2)
+
+    @torch.no_grad()
+    def encode_text_tokens(self, sentences: Sequence[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        '''BERT token features ``(n, L, 768)`` float32 and padding mask ``(n, L)`` (True = padding), on CPU.'''
+        from transformers import AutoTokenizer, BertConfig, BertModel  # noqa: PLC0415
+
+        tokenizer = AutoTokenizer.from_pretrained(BERT_CHECKPOINT)
+        bert = None
+        if self.pretrained:
+            try:
+                bert = BertModel.from_pretrained(BERT_CHECKPOINT)
+            except Exception as exc:  # noqa: BLE001 — pretrained download can fail in many ways
+                warnings.warn(f'failed to load pretrained BERT: {exc}; falling back to random init', stacklevel=2)
+        if bert is None:
+            bert = BertModel(BertConfig())
+        batch = tokenizer(list(sentences), padding=True, return_tensors='pt')
+        tokens = bert.eval()(input_ids=batch['input_ids'], attention_mask=batch['attention_mask']).last_hidden_state
+        return tokens.float(), batch['attention_mask'] == 0
+
+
 def _clip_attnpool(pool: nn.Module, x: torch.Tensor) -> torch.Tensor:
     '''open_clip ``AttentionPool2d.forward``, with the positional embedding resized to the input grid.'''
     n, c, h, w = x.shape
@@ -358,7 +447,9 @@ __all__ = [
     'IMAGENET_STD',
     'KINETICS_MEAN',
     'KINETICS_STD',
+    'VIDEOMAE_BACKBONES',
     'VIDEO_BACKBONES',
     'VideoEncoder',
+    'VideoMAEEncoder',
     'preprocess_video_batch',
 ]

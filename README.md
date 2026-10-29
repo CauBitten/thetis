@@ -92,7 +92,7 @@ Thetis/
 │   │   ├── protonet.py         # Baseline: Prototypical Networks
 │   │   ├── trx.py              # TRX (cross-attention temporal) — implementado
 │   │   ├── mvp_shot.py         # MVP-Shot (alinhamento multi-velocidade) — implementado
-│   │   ├── safsar.py           # SAFSAR (vídeo + texto)
+│   │   ├── safsar.py           # SAFSAR (vídeo + texto) — implementado
 │   │   └── vpd.py              # Video Pose Distillation
 │   ├── training/
 │   │   ├── meta_trainer.py     # Loop de meta-treino episódico
@@ -107,7 +107,8 @@ Thetis/
 │   ├── 03_results.ipynb        # Análise comparativa entre métodos
 │   ├── kaggle_train_protonet.ipynb  # Meta-treino no Kaggle (5 modalidades × 1/5-shot, com --resume)
 │   ├── kaggle_train_trx.ipynb       # Idem para o TRX (ResNet-50 por frame)
-│   └── kaggle_train_mvp_shot.ipynb  # Idem para o MVP-Shot (CLIP ResNet-50 + texto)
+│   ├── kaggle_train_mvp_shot.ipynb  # Idem para o MVP-Shot (CLIP ResNet-50 + texto)
+│   └── kaggle_train_safsar.ipynb    # Idem para o SAFSAR (VideoMAE-Base + BERT)
 │
 ├── experiments/
 │   ├── configs/                # Um .yaml por experimento (método × modalidade × N × K)
@@ -291,6 +292,19 @@ pesos do CLIP via `open_clip_torch` (~390 MB). O artigo não publicou código: a
 escolhas que ele deixa em aberto estão na seção "MVP-Shot" de
 [`experiments/configs/README.md`](experiments/configs/README.md).
 
+### Meta-treinar o SAFSAR
+
+```bash
+uv run python src/training/meta_trainer.py \
+    --config experiments/configs/safsar_rgb_5w5s.yaml
+```
+
+Mesmo protocolo de dados do TRX e do MVP-Shot (8 frames, `segment`, 112²), com
+VideoMAE-Base (3D) e as descrições dos golpes codificadas pelo BERT. O primeiro
+uso baixa os pesos do Hugging Face via `transformers` (~800 MB). O artigo não
+publicou código: as escolhas que ele deixa em aberto estão na seção "SAFSAR" de
+[`experiments/configs/README.md`](experiments/configs/README.md).
+
 Cada run grava, **a cada época**:
 
 - `outputs/checkpoints/<run_id>/last.pt` (modelo + optimizer + histórico) e `best.pt` (melhor val_acc)
@@ -320,7 +334,8 @@ RNG de augmentation reinicia).
 ### Treinar no Kaggle
 
 Quem não tem GPU local roda por `notebooks/kaggle_train_protonet.ipynb` (ou
-`kaggle_train_trx.ipynb` / `kaggle_train_mvp_shot.ipynb`), que clona este
+`kaggle_train_trx.ipynb` / `kaggle_train_mvp_shot.ipynb` /
+`kaggle_train_safsar.ipynb`), que clona este
 repositório, monta a config derivada e treina. Ele serve as cinco
 modalidades × {1-shot, 5-shot}: escolha `MODALITY` e `K_SHOT` na seção 1 e o
 resto do notebook se ajusta.
@@ -344,6 +359,17 @@ A métrica principal é **acurácia média sobre N episódios de teste**, report
 
 - `metrics.json`: mean ± IC 95%, acurácias por episódio, lista de classes.
 - `confusion.csv` + `confusion.png`: matriz de confusão por classe canônica.
+
+**Robustez à velocidade** (pergunta de pesquisa 2): `--speed-split beginner_to_expert`
+monta os episódios de meta-teste com suporte só de iniciantes (p1–p31) e consulta
+só de especialistas (p32–p55); `expert_to_beginner` faz o contrário. Usa o mesmo
+checkpoint, sem treinar de novo, e grava `metrics_<modo>.json` /
+`confusion_<modo>.png` ao lado dos arquivos padrão:
+
+```bash
+uv run python src/training/eval_episodic.py \
+    --checkpoint outputs/checkpoints/<run_id>/best.pt --speed-split beginner_to_expert
+```
 
 ### Rodar os testes
 
@@ -451,8 +477,8 @@ por combinação:
 | `skeleton_2d` | `protonet_skeleton2d_5w1s.yaml` | `protonet_skeleton2d_5w5s.yaml` |
 | `skeleton_3d` | `protonet_skeleton3d_5w1s.yaml` | `protonet_skeleton3d_5w5s.yaml` |
 
-O TRX e o MVP-Shot têm os mesmos 10, com prefixos `trx_` e `mvp_shot_`
-(`trx_rgb_5w1s.yaml`, …, `mvp_shot_skeleton3d_5w5s.yaml`).
+O TRX, o MVP-Shot e o SAFSAR têm os mesmos 10, com prefixos `trx_`,
+`mvp_shot_` e `safsar_` (`trx_rgb_5w1s.yaml`, …, `safsar_skeleton3d_5w5s.yaml`).
 
 Cenários previstos:
 

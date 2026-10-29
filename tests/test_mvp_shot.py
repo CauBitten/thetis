@@ -80,6 +80,23 @@ def test_psti_outputs_one_tensor_per_velocity() -> None:
         psti(torch.randn(2, 6, 8))
 
 
+def test_psti_is_scale_invariant_and_queries_skip_channel_correction() -> None:
+    '''Regression for the first version, whose activations grew velocity after velocity until fp16 overflowed.'''
+    torch.manual_seed(0)
+    psti = PSTI(dim=8, n_scales=3, heads=2, mlp_dim=16, attn_dropout=0.0, ffn_dropout=0.0).eval()
+    x, text = torch.randn(2, 8, 8), torch.randn(2, 8)
+    with torch.no_grad():
+        for t in (None, text):  # every velocity's input is layer-normalised
+            small, big = psti(x, t), psti(1e4 * x, t)
+            assert torch.allclose(small[0], big[0], atol=1e-4)  # 1st velocity depends only on LayerNorm(x)
+            assert all(float(v.abs().max()) < 100 for v in big)  # later ones stay bounded: no compounding growth
+        before = psti(x)
+        for block in psti.blocks:
+            block.channel_mlp[-1].bias.fill_(1e6)  # a runaway correction...
+        assert all(torch.allclose(a, b) for a, b in zip(before, psti(x)))  # ...never reaches the query path
+        assert all(float(v.abs().max()) < 100 for v in psti(x, text))     # ...and is capped by tanh on the support
+
+
 # ---------------------------------------------------------------------------
 # MVP-Shot head (toy CLIP-like encoder)
 # ---------------------------------------------------------------------------
