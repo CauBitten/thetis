@@ -28,6 +28,7 @@ from src.models.encoders import (
 from src.models.mvp_shot import MVPShot
 from src.models.protonet import ProtoNet
 from src.models.safsar import SAFSAR
+from src.models.supervised import SupervisedBaseline
 from src.models.trx import TRX
 
 METHODS: dict[str, type[EpisodicModel]] = {
@@ -35,6 +36,7 @@ METHODS: dict[str, type[EpisodicModel]] = {
     'trx': TRX,
     'mvp_shot': MVPShot,
     'safsar': SAFSAR,
+    'supervised': SupervisedBaseline,
 }
 
 

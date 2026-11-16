@@ -11,6 +11,7 @@ from src.models.factory import METHODS, build_encoder, build_model
 from src.models.mvp_shot import MVPShot
 from src.models.protonet import ProtoNet
 from src.models.safsar import SAFSAR
+from src.models.supervised import SupervisedBaseline
 from src.models.trx import TRX
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
     'MVPShot',
     'ProtoNet',
     'SAFSAR',
+    'SupervisedBaseline',
     'TRX',
     'VideoEncoder',
     'VideoMAEEncoder',

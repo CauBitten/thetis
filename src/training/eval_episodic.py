@@ -12,7 +12,12 @@ Outputs land under ``outputs/results/<run_id>/`` as ``metrics.json`` plus a
 confusion-matrix PNG. ``--speed-split beginner_to_expert`` (support from
 p1–p31, query from p32–p55) or ``expert_to_beginner`` evaluates the speed
 robustness subgroup instead; its files get a ``_<mode>`` suffix, so they sit
-next to the standard ones.
+next to the standard ones. ``--k-shot`` evaluates the checkpoint at another K
+than its config (one supervised model, tested at K=1 and K=5); its files get a
+``_<k>shot`` suffix. ``--head protonet`` scores the checkpoint's encoder with
+the ProtoNet head instead of its own (supervised encoder + prototypes, which
+isolates the training from the test-time classifier); its files get a
+``_<head>`` suffix.
 '''
 from __future__ import annotations
 
@@ -39,7 +44,7 @@ from src.data.loader import (  # noqa: E402
     ThetisDataset,
     load_exclusions,
 )
-from src.models.factory import build_encoder, build_model  # noqa: E402
+from src.models.factory import METHODS, build_encoder, build_model  # noqa: E402
 from src.training.meta_trainer import (  # noqa: E402
     EpisodeLoader,
     assemble_episode_tensors,
@@ -117,11 +122,24 @@ def run_eval(
     n_episodes: int | None,
     device_arg: str | None,
     speed_split: str = 'none',
+    k_shot: int | None = None,
+    head: str | None = None,
 ) -> dict[str, Any]:
-    '''Evaluate a checkpoint against ``meta_test`` episodes.'''
+    '''Evaluate a checkpoint against ``meta_test`` episodes.
+
+    ``k_shot`` overrides the config's K; ``head`` scores with another method's head,
+    loading only the checkpoint's encoder (so the head must have no weights: protonet).
+    '''
     ckpt_path = Path(checkpoint_path).resolve()
     blob = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     cfg: dict[str, Any] = blob['config']
+    if k_shot is not None:
+        if episodes_jsonl is not None:
+            raise ValueError('--k-shot re-samples the episodes; it cannot be combined with --episodes')
+        cfg['episode']['k_shot'] = int(k_shot)
+    if head is not None:
+        cfg['method'] = head
+        cfg.pop('model', None)  # the checkpoint head's kwargs don't apply to the new head
     modality = cfg['modalities'][0]
     if modality not in PATH_COLUMNS:
         raise ValueError(f'unknown modality {modality!r}')
@@ -135,7 +153,10 @@ def run_eval(
     # Chunked encoding only bounds memory here: in eval() BatchNorm uses running
     # stats, so the chunk size does not change the embeddings.
     model = build_model(cfg, encoder, encoder_batch_size=encoder_cfg.get('batch_size')).to(device)
-    model.load_state_dict(blob['model_state'])
+    state = blob['model_state']
+    if head is not None:  # strict load below fails loudly if the new head has weights of its own
+        state = {k: v for k, v in state.items() if k.startswith('encoder.')}
+    model.load_state_dict(state)
     model.eval()
 
     eval_transform = build_eval_transform(cfg['data'])
@@ -208,7 +229,8 @@ def run_eval(
     run_id = cfg.get('run_id') or ckpt_path.parent.name
     results_dir = Path(output_root) / 'results' / run_id
     results_dir.mkdir(parents=True, exist_ok=True)
-    suffix = '' if speed_split == 'none' else f'_{speed_split}'
+    parts = [None if k_shot is None else f'{k_shot}shot', head, None if speed_split == 'none' else speed_split]
+    suffix = ''.join(f'_{part}' for part in parts if part)
     metrics_path = results_dir / f'metrics{suffix}.json'
     confusion_csv = results_dir / f'confusion{suffix}.csv'
     confusion_png = results_dir / f'confusion{suffix}.png'
@@ -217,6 +239,7 @@ def run_eval(
         'run_id': run_id,
         'checkpoint': str(ckpt_path),
         'evaluated_at': _dt.datetime.now(_dt.timezone.utc).isoformat(timespec='seconds'),
+        'method': cfg['method'],
         'n_episodes': len(accs),
         'speed_split': speed_split,
         'n_way': int(n_way),
@@ -254,6 +277,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--n-episodes', type=int, default=None)
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument(
+        '--k-shot',
+        type=int,
+        default=None,
+        help="Support examples per class, overriding the checkpoint config's k_shot (files get a _<k>shot suffix).",
+    )
+    parser.add_argument(
+        '--head',
+        choices=sorted(METHODS),
+        default=None,
+        help="Score with this method's head, keeping only the checkpoint's encoder (e.g. protonet on a "
+        'supervised encoder); the head must have no weights of its own. Files get a _<head> suffix.',
+    )
+    parser.add_argument(
         '--speed-split',
         choices=['none', 'beginner_to_expert', 'expert_to_beginner'],
         default='none',
@@ -272,6 +308,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         n_episodes=args.n_episodes,
         device_arg=args.device,
         speed_split=args.speed_split,
+        k_shot=args.k_shot,
+        head=args.head,
     )
     return 0
 

@@ -41,6 +41,9 @@ do Kaggle sobrescreve `cfg["run_id"]` depois de carregar, então não é afetado
 Os 10 do TRX, do MVP-Shot e do SAFSAR seguem o mesmo padrão, com prefixos
 `trx_`, `mvp_shot_` e `safsar_` (`trx_rgb_5w1s.yaml`, …, `safsar_skeleton3d_5w5s.yaml`).
 
+O supervisionado tem um config por modalidade, sem K: `supervised_rgb.yaml`, …,
+`supervised_skeleton3d.yaml` (ver a seção dele).
+
 Arquivos com prefixo `_` (`_kaggle_active.yaml`) são derivados gerados pelo
 notebook — não edite à mão.
 
@@ -216,7 +219,7 @@ diretório nenhuma delas é omitida.
 
 | Chave | Default | Efeito |
 | --- | --- | --- |
-| `method` | — (obrigatória) | Cabeça few-shot, registrada em `METHODS` (`src/models/factory.py`). Hoje: `protonet`, `trx`, `mvp_shot`, `safsar`. |
+| `method` | — (obrigatória) | Cabeça few-shot, registrada em `METHODS` (`src/models/factory.py`). Hoje: `protonet`, `trx`, `mvp_shot`, `safsar` e `supervised` (baseline sem episódios). |
 | `model` | `{}` | Hiperparâmetros do método, repassados como kwargs ao construtor da cabeça. O ProtoNet não tem nenhum; os do TRX, do MVP-Shot e do SAFSAR estão nas seções deles, abaixo. |
 | `run_id` | `<method>_<mod>_<k>s_<timestamp>` | Nome dos diretórios de checkpoint e log. Ver acima. |
 | `modalities` | — (obrigatória) | Lista de 1 elemento; a Fase 2 aceita uma modalidade por config. Válidos: `rgb`, `depth`, `mask`, `skeleton_2d`, `skeleton_3d`. |
@@ -357,6 +360,41 @@ entre métodos treinados com `crop` e com `segment`. O que muda é só a
 augmentation temporal do treino — registre o modo usado ao comparar resultados.
 Para `segment`, use `temporal_oversample: 4` (com `frame_count: 8` são 32 frames
 decodificados, o mesmo custo de cache do ProtoNet com 16 × 2).
+
+## Supervisionado
+
+Implementação em `src/models/supervised.py`, o *Baseline* de Chen et al. (ICLR 2019).
+Usa o mesmo encoder, os mesmos dados e o mesmo split do ProtoNet; muda só o treino:
+
+- **Treino:** encoder + um classificador linear nas 6 classes de meta-treino, entropia
+  cruzada em mini-lotes de `encoder.batch_size` clipes embaralhados. Uma época é uma
+  passada pelos clipes de meta-treino (~990 no RGB), sem episódios. `n_way`, `q_query`,
+  `episodes_per_epoch` e `stream_query` não entram no treino.
+- **Validação e teste:** episódicos, iguais aos dos outros métodos. O encoder fica
+  congelado e um classificador linear novo é ajustado nos K exemplos de suporte de
+  cada episódio; o classificador do treino é descartado.
+
+O treino não depende de K, então há **um config por modalidade** (`supervised_rgb.yaml`,
+…, `supervised_skeleton3d.yaml`) e um único modelo, avaliado em 1-shot e em 5-shot com
+`eval_episodic.py --k-shot 1` / `--k-shot 5` (arquivos `metrics_1shot.json` /
+`metrics_5shot.json`). Com a mesma seed, split e filtros, esses episódios de teste são
+os mesmos dos runs few-shot `_5w1s` / `_5w5s`. O bloco `episode` só descreve a
+avaliação: `k_shot: 5` é o K dos episódios de validação que escolhem o `best.pt`
+(os métodos few-shot validam no K do próprio run).
+
+`eval_episodic.py --head protonet` avalia o mesmo encoder com os protótipos do ProtoNet
+em vez do classificador linear (arquivos `metrics_<k>shot_protonet*.json`). Contra o
+ProtoNet, aí só muda o treino; contra o supervisionado com classificador linear, só
+muda o classificador do teste.
+
+### `model` (chaves do supervisionado)
+
+| Chave | Default | Efeito |
+| --- | --- | --- |
+| `train_classes` | — (obrigatória) | Classes do classificador de treino; o trainer confere contra o split de meta-treino. |
+| `finetune_epochs` | `100` | Épocas do ajuste no suporte de cada episódio (Chen et al.). |
+| `finetune_batch_size` | `4` | Lote desse ajuste (Chen et al.). |
+| `finetune_lr` | `0.01` | SGD com momentum 0.9, dampening 0.9 e weight decay 1e-3 (Chen et al.). |
 
 ## TRX
 

@@ -14,6 +14,10 @@ forces ``pretrained=False`` on the encoder so no network download is required.
 
 ``last.pt`` and the JSON log are rewritten every epoch, so a run killed by a
 hosted-runtime time cap (Kaggle/Colab) can be continued with ``--resume``.
+
+``method: supervised`` swaps the episodes for plain mini-batch cross-entropy over
+the meta-train clips (:func:`_supervised_epoch`); validation, checkpoints, log and
+resume are the same.
 '''
 from __future__ import annotations
 
@@ -433,6 +437,44 @@ def _train_step_streaming(
     return total_loss, correct / n_query
 
 
+def _supervised_epoch(
+    model: EpisodicModel,
+    sample_ids: list[str],
+    labels: np.ndarray,
+    loader: EpisodeLoader,
+    optimizer: optim.Optimizer,
+    scaler: Any,
+    use_amp: bool,
+    device: torch.device,
+    batch_size: int,
+    rng: np.random.Generator,
+    max_batches: int | None = None,
+) -> tuple[list[float], list[float]]:
+    '''One shuffled pass over the meta-train clips: cross-entropy of ``model.classifier``. Per-batch (loss, acc).'''
+    amp_ctx = torch.amp.autocast(device_type='cuda', dtype=torch.float16) if use_amp else _nullcontext()
+    order = rng.permutation(len(sample_ids))
+    losses: list[float] = []
+    accs: list[float] = []
+    for start in range(0, len(order), batch_size)[:max_batches]:
+        idx = order[start : start + batch_size]
+        videos = loader.load([sample_ids[i] for i in idx]).to(device, non_blocking=True)
+        targets = torch.as_tensor(labels[idx], dtype=torch.long, device=device)
+        optimizer.zero_grad(set_to_none=True)
+        with amp_ctx:
+            logits = model.classifier(model.encoder(videos))
+            loss = F.cross_entropy(logits, targets)
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+        losses.append(float(loss.detach()))
+        accs.append(float((logits.detach().argmax(dim=-1) == targets).float().mean()))
+    return losses, accs
+
+
 def run_training(
     cfg: dict[str, Any],
     smoke: bool,
@@ -591,6 +633,13 @@ def run_training(
         raise ValueError(
             f'model.train_classes {sorted(model_train_classes)} != meta_train split {sorted(splits["meta_train"])}'
         )
+    supervised = cfg['method'] == 'supervised'
+    if supervised:
+        # Same clip pool the episodes would draw from (modality filter + exclusions applied).
+        pool = train_sampler.df[train_sampler.df['action_label'].isin(model.train_classes)]
+        sup_ids = pool['sample_id'].astype(str).tolist()
+        sup_labels = pool['action_label'].map({c: i for i, c in enumerate(model.train_classes)}).to_numpy()
+        print(f'[setup] supervised: {len(sup_ids)} meta_train clips, batch={encoder_batch_size}', flush=True)
 
     # Mixed precision: fp16 autocast on CUDA cuts activations roughly in half
     # and is the easiest knob to keep R(2+1)D-18 fitting in 4 GB GPUs.
@@ -705,22 +754,42 @@ def run_training(
         model.train()
         epoch_losses: list[float] = []
         epoch_accs: list[float] = []
-        for i in range(episodes_per_epoch):
-            ep_idx = (epoch - 1) * episodes_per_epoch + i
-            ep = train_sampler.sample_episode('meta_train', ep_idx)
-            tensors = assemble_episode_tensors(train_loader, ep, device)
-            profile = mem_profile and epoch == 1 and i < 3
-            if profile and device.type == 'cuda':
-                torch.cuda.reset_peak_memory_stats()
-                _log_cuda_mem('episode-start', device)
-            if stream_query:
-                step_loss, step_acc = _train_step_streaming(
-                    model, tensors, n_way_train, optimizer, scaler, use_amp, device, profile=profile
-                )
-            else:
-                optimizer.zero_grad(set_to_none=True)
-                if use_amp:
-                    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+        if supervised:
+            epoch_losses, epoch_accs = _supervised_epoch(
+                model, sup_ids, sup_labels, train_loader, optimizer, scaler, use_amp, device,
+                batch_size=encoder_batch_size,
+                rng=np.random.default_rng(seed + epoch),  # per-epoch order, so --resume replays it
+                max_batches=1 if smoke else None,
+            )
+        else:
+            for i in range(episodes_per_epoch):
+                ep_idx = (epoch - 1) * episodes_per_epoch + i
+                ep = train_sampler.sample_episode('meta_train', ep_idx)
+                tensors = assemble_episode_tensors(train_loader, ep, device)
+                profile = mem_profile and epoch == 1 and i < 3
+                if profile and device.type == 'cuda':
+                    torch.cuda.reset_peak_memory_stats()
+                    _log_cuda_mem('episode-start', device)
+                if stream_query:
+                    step_loss, step_acc = _train_step_streaming(
+                        model, tensors, n_way_train, optimizer, scaler, use_amp, device, profile=profile
+                    )
+                else:
+                    optimizer.zero_grad(set_to_none=True)
+                    if use_amp:
+                        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                            out = model(
+                                tensors['support'],
+                                tensors['query'],
+                                tensors['support_labels'],
+                                tensors['query_labels'],
+                                n_way=n_way_train,
+                                class_names=tensors['classes'],
+                            )
+                        scaler.scale(out['loss']).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
                         out = model(
                             tensors['support'],
                             tensors['query'],
@@ -729,36 +798,24 @@ def run_training(
                             n_way=n_way_train,
                             class_names=tensors['classes'],
                         )
-                    scaler.scale(out['loss']).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    out = model(
-                        tensors['support'],
-                        tensors['query'],
-                        tensors['support_labels'],
-                        tensors['query_labels'],
-                        n_way=n_way_train,
-                        class_names=tensors['classes'],
+                        out['loss'].backward()
+                        optimizer.step()
+                    step_loss = float(out['loss'].detach().cpu().item())
+                    step_acc = out['accuracy']
+                    del out
+                if profile:
+                    _log_cuda_mem('episode-end', device)
+                epoch_losses.append(step_loss)
+                epoch_accs.append(step_acc)
+                del tensors
+                if (i + 1) % progress_every == 0 or (i + 1) == episodes_per_epoch:
+                    running_loss = float(np.mean(epoch_losses))
+                    running_acc = float(np.mean(epoch_accs))
+                    print(
+                        f'[epoch {epoch}/{epochs}] {i + 1:>4}/{episodes_per_epoch}  '
+                        f'loss={running_loss:.4f} acc={running_acc:.4f}',
+                        flush=True,
                     )
-                    out['loss'].backward()
-                    optimizer.step()
-                step_loss = float(out['loss'].detach().cpu().item())
-                step_acc = out['accuracy']
-                del out
-            if profile:
-                _log_cuda_mem('episode-end', device)
-            epoch_losses.append(step_loss)
-            epoch_accs.append(step_acc)
-            del tensors
-            if (i + 1) % progress_every == 0 or (i + 1) == episodes_per_epoch:
-                running_loss = float(np.mean(epoch_losses))
-                running_acc = float(np.mean(epoch_accs))
-                print(
-                    f'[epoch {epoch}/{epochs}] {i + 1:>4}/{episodes_per_epoch}  '
-                    f'loss={running_loss:.4f} acc={running_acc:.4f}',
-                    flush=True,
-                )
 
         epoch_record: dict[str, Any] = {
             'epoch': epoch,

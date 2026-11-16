@@ -196,6 +196,7 @@ site/
 # PDFs de referência grandes (mantenha apenas notas em docs/notes.md)
 /docs/references/*.pdf
 !/docs/references/.gitkeep
+/docs/article
 
 # Arquivos baixados durante experimentos
 scratch/
